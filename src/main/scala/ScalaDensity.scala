@@ -1,4 +1,4 @@
-import scalaz._
+import scalaz.{ Ordering => OrderingZ, _ }
 import Scalaz._
 // import co.theasi.plotly.{Plot, draw, ScatterOptions, ScatterMode}
 // import scalax.chart.api._
@@ -8,7 +8,7 @@ import vegas._
 import scala.math.{min, max}
 import scala.math.BigInt._
 
-import scala.collection.mutable.HashMap
+import scala.collection.mutable.{ HashMap, PriorityQueue }
 import scala.collection.mutable.{ Set => MSet, Map => MMap }
 import scala.collection.{mutable, immutable}
 import scala.collection.immutable.{Set, Map}
@@ -22,8 +22,11 @@ import org.apache.spark.{ SparkContext, SparkConf }
 import org.apache.spark.sql.SQLContext
 import org.apache.log4j.{ Logger, Level }
 
+import java.io.IOException
 import java.nio.file.{Paths, Files}
 import java.nio.charset.StandardCharsets
+
+import scala.util.Sorting
 
 object ScalaDensity {
   case class Rectangle(low : Array[Double], high : Array[Double]) {
@@ -55,34 +58,28 @@ object ScalaDensity {
   def point(v : MLVector) : Rectangle = Rectangle(v.toArray, v.toArray)
 
   def hull(b1 : Rectangle, b2 : Rectangle) : Rectangle =
-    Rectangle( ( b1.low, b2.low).zipped map min,
+    Rectangle( ( b1.low, b2.low ).zipped map min,
                (b1.high, b2.high).zipped map max )
 
-  type InfiniteTree[T] = BigInt => T
-  type FiniteTree[T] = Map[BigInt, T]
-  // type PartialTree[T]  = InfiniteTree[Option[T]]
-  // type MutableTree[T]  = HashMap[BigInt, T]
+  type NodeLabel = BigInt
+  val rootLabel : NodeLabel = 1
 
-  // def unsafeFreeze[T](t : MutableTree[T])  : PartialTree[T] = t.get
-  // def freeze[T](      t : MutableTree[T])  : PartialTree[T] = t.toMap.get
-  // def toPartial[T](   t : InfiniteTree[T]) : PartialTree[T] = (x => Some(t(x)))
-  // def restrict[T](    t : InfiniteTree[T], to : Set[BigInt]) : PartialTree[T] =
-  //   x => if(to.apply(x)) some(t(x)) else none
+  def  left(x : NodeLabel) : NodeLabel = 2*x
+  def right(x : NodeLabel) : NodeLabel = 2*x + 1
 
-  // def standardBasis(dim : Int) : Array[MLVector] =
-  //   (1 to dim).map {
-  //     i => MLVectors.dense(Array.fill(dim)(0.0).updated(i-1, 1.0))
-  //   }.toArray
+  def isAncestorOf(a : NodeLabel, b : NodeLabel) : Boolean =
+    (b >> (b.bitLength - a.bitLength)) == a
+
+  type InfiniteTree[T] = NodeLabel => T
+  type FiniteTree[T] = Map[NodeLabel, T]
 
   def binarySplitTree(bbox : Rectangle) : InfiniteTree[(Rectangle, Double, Int)] = {
-    val root : BigInt = 1
     val d = bbox.dim
-    // val basis = standardBasis(d)
 
     // Tree that caches bounding box and depth of every node
     lazy val t : InfiniteTree[(Rectangle, Double, Int)] =
       Memo.mutableHashMapMemo {
-        case `root` => (bbox, bbox.centre(0), 0)
+        case `rootLabel` => (bbox, bbox.centre(0), 0)
         case n =>
           val (pbox, c, paxis) = t(n >> 1)
           val box =
@@ -97,107 +94,131 @@ object ScalaDensity {
     return t
   }
 
-  def left(x : BigInt)  : BigInt = 2*x
-  def right(x : BigInt) : BigInt = 2*x + 1
-
-  // def partitionMap[A, B](f : (A, B) => Boolean)(m : Map[A, B]) : (Map[A, B], Map[A, B]) = {
-  //   val (l, r) = m.toTraversable.partition((x) => f(x._1, x._2))
-  //   (l.toMap, r.toMap)
-  // }
-
   case class Histogram( boxes  : FiniteTree[Rectangle],
                         splits : FiniteTree[(Double, Int)],
                         counts : FiniteTree[Long],
-                        leaves : Set[BigInt] )
+                        leaves : Set[NodeLabel] )
 
-  // Recursive data types in Scala are a mess!
-  // HistogramStream = Long -> (Histogram, HistogramStream)
-  // In each step we have to provide a (possibly) new threshold
-  // sealed trait HistogramStreamT[A <: HistogramStreamT[A]]
-  // class HistogramStream[A <: HistogramStreamT[HistogramStream[A]]] extends HistogramStreamT[A] {
-  //   next : Long => (Histogram, A)
-  // }
-  // Actually, with a single case case class we can avoid all the silliness
-  case class HistogramStream(next : Long => (Histogram, Set[BigInt], HistogramStream))
-
-  def histogramPartial(points : RDD[MLVector]) : HistogramStream = {
-    val bbox = points.map(point(_)).reduce(hull)
-    val fullTree = binarySplitTree(bbox)
-    val boxTree = ((x : BigInt) => fullTree(x)._1)
-    val splitsTree = { (x : BigInt) =>
-      val (_, thresh, axis) = fullTree(x)
-      (thresh, axis)
-    }
-
-    def go( positions : RDD[(BigInt, MLVector)],
-            accCounts   : Map[BigInt, Long],
-            accInternal : Set[BigInt],
-            accLeaves   : Set[BigInt],
-            accBoxes    : Map[BigInt, Rectangle],
-            accSplits   : Map[BigInt, (Double, Int)] ) : HistogramStream =
-      HistogramStream({ splitThresh : Long =>
-                        // val currCounts = positions.mapValues(x => 1L).reduceByKeyLocally(_+_)
-                        val currCounts = positions.countByKey()
-                        // val (doSplit, dontSplit) = partitionMap((k : BigInt, v : Long) => v >= splitThresh)(currCounts.toMap)
-                        val (doSplit, dontSplit) = currCounts.partition(_._2 > splitThresh)
-                        val newCounts = accCounts ++ currCounts
-                        val hist = Histogram(accBoxes, accSplits, newCounts, accLeaves)
-                        ////
-                        if(doSplit.isEmpty) {
-                          (hist, Set(), go(positions, newCounts, accInternal, accLeaves, accBoxes, accSplits))
-                        } else {
-                          val newInternal = accInternal ++ doSplit.keySet
-                          val oldLeaves   = doSplit.keySet
-                          val addLeaves   = oldLeaves.flatMap(x => Array(left(x), right(x))).toSet
-                          val newLeaves   = (accLeaves -- oldLeaves) ++ addLeaves
-                          val newBoxes    = accBoxes ++ addLeaves.map(x => (x, boxTree(x)))
-                          val addSplits   = doSplit.mapValues(x => splitsTree(x))
-                          val newSplits   = accSplits ++ addSplits
-                          // val newPositions   = positions.filter({ case (k, v) => doSplit.isDefinedAt(k) }).
-                          //   map({ case (k, v) =>
-                          //         val (thresh, axis) = newSplits(k)
-                          //         if(v(axis) < thresh) {
-                          //           (left(k), v)
-                          //         } else {
-                          //           (right(k), v)
-                          //         }
-                          //       }).localCheckpoint()
-                          val newPositions = positions.
-                            map({ case (k, v) =>
-                                  val (thresh, axis) = newSplits(k)
-                                  if(v(axis) < thresh) {
-                                    (left(k), v)
-                                  } else {
-                                   (right(k), v)
-                                  }
-                                }).localCheckpoint()
-                          (hist, addLeaves, go(newPositions, newCounts, newInternal, newLeaves, newBoxes, newSplits))
-                        }
-                      })
-
-    return go(points.map((1,_)), Map(), Set(), Set(1), Map( BigInt(1) -> boxTree(1) ), Map())
-  }
-
-  def hist(points : RDD[MLVector], splitThresh : Long) : Histogram = {
-    def go(hs : HistogramStream) : Histogram = {
-      val (h, newLeaves, newHs) = hs.next(splitThresh)
-      if(newLeaves.isEmpty)
-        h
+  // Produce a stream of (Histogram, new nodes) pairs given
+  // stream of As (usually A is the type of some stopping threshold )
+  case class HistogramStream[A](next : A => (Histogram, Set[NodeLabel], HistogramStream[A])) {
+    // Iterate until fixed point
+    def fix(v : A) : Stream[Histogram] = {
+      val (h, n, hs) = next(v)
+      if(n.isEmpty)
+        h #:: Stream.empty
       else
-        go(newHs)
+        h #:: hs.fix(v)
     }
-    go(histogramPartial(points))
   }
 
-  def query(f : Histogram, p : MLVector) : BigInt = {
-    var node = 1
+  def histogramPartial[A]( points : RDD[MLVector],
+                           stoprule : (A, Long, Rectangle) => Boolean)
+      : HistogramStream[A] = {
+    val fullTree = binarySplitTree(points.map(point(_)).reduce(hull))
+    val boxTree = fullTree map { case (box, _, _) => box }
+    val splitsTree = fullTree map { case (_, thresh, axis) => (thresh, axis) }
+
+    def go(  cells : RDD[(NodeLabel, MLVector)], // Current partition cells
+         accCounts : Map[NodeLabel, Long], // Current cell counts
+       accInternal : Set[NodeLabel], // Current internal nodes
+         accLeaves : Set[NodeLabel], // Current leaf nodes
+          accBoxes : Map[NodeLabel, Rectangle], // Current cell boundaries
+         accSplits : Map[NodeLabel, (Double, Int)] ) // Current splitting hyperpls.
+        : HistogramStream[A] =
+      HistogramStream {
+        // TODO: Some of the accumulator variables can be made mutable
+        v : A =>
+        val currCounts = cells.countByKey()
+        val (doSplit, dontSplit) = currCounts.partition {
+          case (lab, count) =>
+            stoprule(v, count, accBoxes(lab))
+        }
+        // TODO: keep empty leaves separate to speed things up a bit
+        val emptyLeaves =
+          accLeaves.filter(!currCounts.isDefinedAt(_)).map((_, 0L))
+        val newCounts = accCounts ++ currCounts ++ emptyLeaves
+        val hist = Histogram(accBoxes, accSplits, newCounts, accLeaves)
+        if(doSplit.isEmpty) {
+          ( hist, Set(),
+            go(cells, newCounts, accInternal, accLeaves, accBoxes, accSplits) )
+        } else {
+          // All leaves that fit the splitting criteria become internal nodes
+          val oldLeaves   = doSplit.keySet
+          val newInternal = accInternal ++ oldLeaves
+          // Both children of all the split leaves become new leaves
+          val addLeaves   = oldLeaves.flatMap(x => Array(left(x), right(x))).toSet
+          val newLeaves   = (accLeaves -- oldLeaves) ++ addLeaves
+          // Pull bounding box and splitting hyperplane from the memoised trees
+          val addBoxes    = addLeaves map { x => (x, boxTree(x)) }
+          val newBoxes    = accBoxes ++ addBoxes
+          // NOTE: Yes, map(identity) looks ridiculous, see
+          // https://issues.scala-lang.org/browse/SI-7005
+          // some sort of strictness problem
+          // NOTE: Also, don't ask me why { splitsTree(_) } is ok but
+          // splitTree does not... Welcome to Scala!
+          val addSplits   =
+            (oldLeaves map { x : NodeLabel => (x, splitsTree(x)) }).toMap
+          val newSplits   = accSplits ++ addSplits
+          // Local checkpoint here for performance reasons
+          val newCells = cells.map {
+            case (k : NodeLabel, v : MLVector) =>
+              if(addSplits.isDefinedAt(k)) {
+                val (thresh, axis) = addSplits(k)
+                if(v(axis) < thresh) {
+                  (left(k), v)
+                } else {
+                  (right(k), v)
+                }
+              } else {
+                (k, v)
+              }
+          }.localCheckpoint()
+          ( hist, addLeaves,
+            go(newCells, newCounts, newInternal, newLeaves, newBoxes, newSplits) )
+        }
+      }
+
+    return go( points.map((1,_)), // Partition cells
+               Map(), // Counts
+               Set(), // Internal nodes
+               Set(1), // Leaf nodes
+               Map( BigInt(1) -> boxTree(1) ), // Cell boundarie
+               Map() ) // Splitting hyperplanes
+  }
+
+  // Compute support carved histogram (without intermediate stops)
+  def supportCarved(      points : RDD[MLVector],
+                     splitThresh : Double,
+                          minVol : Double ) : Histogram = {
+    val totalCount = points.count()
+    def stoprule(noinput : Unit, count : Long, box : Rectangle) : Boolean = {
+      val v = box.volume
+      val p = (1 - count/totalCount)
+      // TODO: Ask Raaz about this criterion again
+      ((count == totalCount) | (p * v >= splitThresh)) && (v > minVol)
+    }
+    histogramPartial(points, stoprule).fix(Unit).last
+  }
+
+  // Compute histogram given volume and count bounds
+  def histogram( points : RDD[MLVector],
+                 splitThresh : Long,
+                 minVol : Double ) : Histogram = {
+    def stoprule(noinput : Unit, count : Long, box : Rectangle) : Boolean =
+      (count >= splitThresh) && (box.volume > minVol)
+    histogramPartial(points, stoprule).fix(Unit).last
+  }
+
+  def query(f : Histogram, p : MLVector) : NodeLabel = {
+    var node = BigInt(1)
     val splits = f.splits
     while(splits.isDefinedAt(node)) {
       val (t, d) = splits(node)
-      if(p(d) <= t) {
-        node = 2*node
+      if(p(d) < t) {
+        node = left(node)
       } else {
-        node = 2*node + 1
+        node = right(node)
       }
     }
     node
@@ -205,55 +226,86 @@ object ScalaDensity {
 
   def density(f : Histogram, p : MLVector) : Double = {
     val node = query(f, p)
-    f.counts(node)/f.boxes(node).volume
+    f.counts(node)/(f.boxes(node).volume * f.counts(1))
   }
 
-  def queryDepth(f : InfiniteTree[(Rectangle, Double, Int)], d : Int, p : MLVector) : BigInt = {
-    var node = 1
-    for(i <- 2 to d) {
-      val (_, t, d) = f(node)
-      if(p(d) <= t) {
-        node = 2*node
-      } else {
-        node = 2*node + 1
-      }
-    }
-    node
+  // NOTE: This is only approximate since we do not collapse cherries
+  //       that no longer satisfy the splitting criterion after removing
+  //       the point.
+  def looL2ErrorApprox(f : Histogram) : Double = {
+    val norm = f.counts(1)
+    f.leaves.map(
+      { x =>
+        val c = f.counts(x)
+        val v = f.boxes(x).volume
+        val dtotsq = (c/norm)*(c/norm)/v // (c/(v*norm))^2 * v
+        val douts = c*(c-1)/(v*(norm - 1)*norm) // 1/norm * (c-1)/(v*(norm-1)) * c
+        dtotsq - 2*douts
+      }).sum
   }
 
-  // def histogram(points : RDD[MLVector], threshold : Int) : (Histogram, RDD[(Int, MLVector)]) = {
-  //   val bboxtree   = root(u.map(point).reduce(hull))
-  //   var bboxes     = Map((1, bboxtree))
-  //   var leafcounts = Array((1, points.count()))
-  //   var counts     = leafcounts.toMap
-  //   var tree       = points.map(x => (1, x))
-  //   var leafs      = Set(1)
-  //   //
-  //   var needsplit = Array(0)
-  //   do {
-  //     needsplit = leafcounts.filter(_._2 > threshold).map(_._1)
-  //     leafs = leafs -- needsplit ++ needsplit.flatMap(x => Array(2*x, 2*x + 1))
-  //     bboxes = bboxes ++ needsplit.flatMap(x => Array((2*x, bboxes(x).lower), (2*x + 1, bboxes(x).upper)))
-  //     //println(leafs)
-  //     //needsplit.foreach(print)
-  //     //println("")
-  //     val splits = needsplit.map(x => (x, (bboxes(x).splitAlong, bboxes(x).splitAt))).toMap
-  //     //println(splits)
-  //     tree = tree.map(n => if(splits contains n._1) {
-  //                       val (along, at) = splits(n._1)
-  //                       if(n._2(along) > at) { (2*n._1 + 1, n._2) }
-  //                       else                 { (  2*n._1  , n._2) }
-  //                     } else { n })
-  //     leafcounts = leafCounts(tree)
-  //     counts = counts ++ leafcounts
-  //   } while (needsplit.length > 0);
-  //   (Histogram(bboxtree, counts, leafs), tree)
+  // def queryDepth(f : InfiniteTree[(Rectangle, Double, Int)], d : Int, p : MLVector) : NodeLabel = {
+  //   var node = 1
+  //   for(i <- 2 to d) {
+  //     val (_, t, d) = f(node)
+  //     if(p(d) <= t) {
+  //       node = left(node)
+  //     } else {
+  //       node = right(node)
+  //     }
+  //   }
+  //   node
   // }
 
+  def depthFirst[A](t : FiniteTree[A]) : Stream[(Int, NodeLabel, A)] = {
+    def go(lev : Int, lab : NodeLabel) : Stream[(Int, NodeLabel, A)] = {
+      if(t.isDefinedAt(lab))
+        (lev, lab, t(lab)) #:: go(lev+1, left(lab)) #::: go(lev+1, right(lab))
+      else
+        Stream.empty
+    }
+    go(1, 1)
+  }
+
+  // NOTE: Warning, does not check to make sure something is a cherry!
+  def cutCherry(h : Histogram, lab : BigInt) : Histogram = {
+    // TODO: Should the others be pruned as well, to conserve memory?
+    Histogram( h.boxes, h.splits - lab, h.counts,
+               h.leaves + lab - left(lab) - right(lab) )
+  }
+
+  def backtrack[H]( hs : Histogram,
+                    prio : (Int, NodeLabel, Long, Double) => H)(implicit ord : Ordering[H])
+      : Stream[(Histogram, Long, Long, Double, Double)] = {
+
+    // Rewrite this in terms of PartialOrder[NodeLabel] and lexicographic order
+    object BacktrackOrder extends Ordering[(H, NodeLabel)] {
+      def compare(x : (H, NodeLabel), y : (H, NodeLabel)) = {
+        val (xH, xLab) = x
+        val (yH, yLab) = y
+        if(isAncestorOf(xLab, yLab)) -1
+        else if(isAncestorOf(yLab, xLab)) 1
+        else ord.compare(xH, yH)
+      }
+    }
+
+    var q = new PriorityQueue()(BacktrackOrder) //(Ordering[H].on({x : (H,NodeLabel) => x._1}))
+    depthFirst(hs.splits).foreach {
+      case (lev, lab, _) =>
+        q += ((prio(lev, lab, hs.counts(lab), hs.boxes(lab).volume), lab))
+    }
+    val sorted : Stream[(H, NodeLabel)] = q.dequeueAll
+    sorted.scanLeft((hs, 0L, 0L, 0.0, 0.0)) {
+      case ((hc, _, _, _, _), (_, lab)) =>
+        ( cutCherry(hc, lab),
+          hs.counts(left(lab)),
+          hs.counts(right(lab)),
+          hs.boxes(left(lab)).volume,
+          hs.boxes(right(lab)).volume )
+    }.tail
+  }
+
   def main(args: Array[String]) = {
-    // val (b,s) = binarySplitTree(Rectangle(Array(0, 0), Array(1, 1)))
-    // println(b(1))
-    // println(b(right(left(1))))
     Logger.getLogger("org").setLevel(Level.ERROR)
     Logger.getLogger("akka").setLevel(Level.ERROR)
 
@@ -262,58 +314,41 @@ object ScalaDensity {
     val sqlContext = new SQLContext(sc)
     import sqlContext.implicits._
 
-    val df = normalVectorRDD(sc, 100, 2)
-    // df foreach println
-    // print(df.map(point(_)).reduce(hull))
+    val df = normalVectorRDD(sc, 200, 2)
 
-    val num = 1
-    val hs = hist(df, 10)
+    val hs1 = supportCarved(df, 5, 0.0005)
+    val hs2 = histogram(df, 10, 0.0005)
 
-    val boxes = binarySplitTree(df.map(point(_)).reduce(hull(_,_)))
-    // print(boxes(1)._3)
-    // print(boxes(left(1))._3)
-    // print(boxes(left(left(1)))._3)
-    // print(boxes(left(left(left(1))))._3)
-    println(boxes(1)._1)
-    println(boxes(left(1))._1)
-    println(boxes(left(left(1)))._1)
-    println(boxes(left(left(left(1))))._1)
+    val hs2path = backtrack(hs2, { case (_, _, count, _) => count })(Ordering[Long].reverse)
 
-    println(boxes(1)._2)
-    println(boxes(left(1))._2)
-    println(boxes(left(left(1)))._2)
-    println(boxes(left(left(left(1))))._2)
-    // println(h(1))
-    // println(h(2))
-    // println(h(3))
-
-    // val p = Plot().withScatter(df.map(_(0)).collect(), df.map(_(1)).collect(), ScatterOptions().mode(ScatterMode.Marker))
-    // draw(p, "test")
-    // XYLineChart(df.collect().map(x => (x(0), x(1)))).show()
-
-    // val data = df.collect().map(x => (x(0), x(1))).toTraversable
-    // XYPlot(data).show()
-
-    // for(i <- 1 to 10) {
-    //   val h = hs(i)
+    def dumpHist(hs : Histogram, path : String) : Unit =
       Files.write(
-        // Paths.get("tmp" + i + ".html"),
-        Paths.get("tmp.html"),
-        Vegas("Example").
-          withData( df.collect().toSeq.map(x => Map("x" -> x(0), "y" -> x(1), "d" -> density(hs, Vectors.dense(x(0), x(1))), "n" -> query(hs, Vectors.dense(x(0), x(1))) )) ).
-          encodeX("x", Quantitative).
-          encodeY("y", Quantitative).
-          // encodeColor("d", Quantitative).
-          encodeColor("nn", Nominal).
+        Paths.get(path),
+        Vegas("Histogra").
+          withData( df.collect().toSeq.map(x =>
+                     Map("x" -> x(0), "y" -> x(1),
+                         "d" -> density(hs, Vectors.dense(x(0), x(1))),
+                         "n" -> query(hs, Vectors.dense(x(0), x(1)))
+                     )
+                   ) ).
+          encodeX("x", Quant).
+          encodeY("y", Quant).
+          // encodeOpacity("d", Quantitative).
+          encodeColor("n", Nom).
           mark(Point).
-          // withData( h.leaves.toArray.map( { x => val i = 1; Map( "x" -> -1, "y" -> -1, "x2" -> 1, "y2" -> 1) } )).
-          // encodeX("x", Quantitative).
-          // encodeY("y", Quantitative).
-          // encodeX2("x2", Quantitative).
-          // encodeY2("y2", Quantitative).
-          // mark(Area).
           html.pageHTML().getBytes(StandardCharsets.UTF_8))
-    // }
+
+    var count = 1
+    dumpHist(hs2, "tmp0.html")
+    println(looL2ErrorApprox(hs2))
+    for((hs, _, _, _, _) <- hs2path) {
+      println(looL2ErrorApprox(hs))
+      dumpHist(hs, "tmp" + count.toString + ".html")
+      count = count + 1
+    }
+
+    // dumpHist(hs1, "tmp1.html")
+    // dumpHist(hs2, "tmp2.html")
     sc.stop()
   }
 }

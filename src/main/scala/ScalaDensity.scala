@@ -1,3 +1,18 @@
+/**************************************************************************
+* Copyright 2017 Tilo Wiklund
+*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+* http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+**************************************************************************/
 import scalaz.{ Ordering => OrderingZ, _ }
 import Scalaz._
 // import co.theasi.plotly.{Plot, draw, ScatterOptions, ScatterMode}
@@ -152,11 +167,7 @@ object ScalaDensity {
           // Pull bounding box and splitting hyperplane from the memoised trees
           val addBoxes    = addLeaves map { x => (x, boxTree(x)) }
           val newBoxes    = accBoxes ++ addBoxes
-          // NOTE: Yes, map(identity) looks ridiculous, see
-          // https://issues.scala-lang.org/browse/SI-7005
-          // some sort of strictness problem
-          // NOTE: Also, don't ask me why { splitsTree(_) } is ok but
-          // splitTree does not... Welcome to Scala!
+          //
           val addSplits   =
             (oldLeaves map { x : NodeLabel => (x, splitsTree(x)) }).toMap
           val newSplits   = accSplits ++ addSplits
@@ -234,14 +245,14 @@ object ScalaDensity {
   //       the point.
   def looL2ErrorApprox(f : Histogram) : Double = {
     val norm = f.counts(1)
-    f.leaves.map(
-      { x =>
+    f.leaves.map{
+        x : NodeLabel =>
         val c = f.counts(x)
         val v = f.boxes(x).volume
-        val dtotsq = (c/norm)*(c/norm)/v // (c/(v*norm))^2 * v
+    	    val dtotsq = (c/norm)*(c/norm)/v // (c/(v*norm))^2 * v
         val douts = c*(c-1)/(v*(norm - 1)*norm) // 1/norm * (c-1)/(v*(norm-1)) * c
         dtotsq - 2*douts
-      }).sum
+    }.sum
   }
 
   // def queryDepth(f : InfiniteTree[(Rectangle, Double, Int)], d : Int, p : MLVector) : NodeLabel = {
@@ -333,8 +344,8 @@ object ScalaDensity {
                    ) ).
           encodeX("x", Quant).
           encodeY("y", Quant).
-          // encodeOpacity("d", Quantitative).
-          encodeColor("n", Nom).
+          encodeOpacity("d", Quantitative).
+          // encodeColor("n", Nom).
           mark(Point).
           html.pageHTML().getBytes(StandardCharsets.UTF_8))
 
@@ -342,6 +353,8 @@ object ScalaDensity {
     dumpHist(hs2, "tmp0.html")
     println(looL2ErrorApprox(hs2))
     for((hs, _, _, _, _) <- hs2path) {
+      // TODO: implement an optimised version that recomputes the the error
+      // based on the previous estimate and count/volume for the collapsed cells
       println(looL2ErrorApprox(hs))
       dumpHist(hs, "tmp" + count.toString + ".html")
       count = count + 1

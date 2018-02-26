@@ -13,30 +13,25 @@
 * See the License for the specific language governing permissions and
 * limitations under the License.
 **************************************************************************/
-import scalaz.{ Ordering => OrderingZ, _ }
-import Scalaz._
-
-import vegas._
-
-import scala.math.{min, max, exp, log}
+import scala.math.{min, max, exp, log, pow, ceil}
 import scala.math.BigInt._
 
 import scala.collection.mutable.{ HashMap, PriorityQueue }
 import scala.collection.mutable.{ Set => MSet, Map => MMap }
 import scala.collection.{mutable, immutable}
 import scala.collection.immutable.{Set, Map}
+import scala.reflect.ClassTag
 
-import org.apache.spark.rdd.RDD
+import org.apache.spark.rdd._
+import org.apache.spark.rdd.PairRDDFunctions._
+import org.apache.spark.mllib.random.RandomRDDs.normalVectorRDD
+
 import org.apache.spark.mllib.linalg
 import org.apache.spark.mllib.linalg.{ Vector => MLVector, _ }
-import org.apache.spark.mllib.random.RandomRDDs.normalVectorRDD
 
 import org.apache.spark.{ SparkContext, SparkConf }
 import org.apache.spark.sql.SQLContext
 import org.apache.log4j.{ Logger, Level }
-
-import java.nio.file.{Paths, Files}
-import java.nio.charset.StandardCharsets
 
 // import scala.util.Sorting
 
@@ -49,9 +44,10 @@ object ScalaDensity {
   type Volume = Double
 
   case class Rectangle(low : Array[Double], high : Array[Double]) {
-    override def toString = (low, high).zipped.toArray.mkString("x")
+    def factorise() : Iterator[(Double, Double)] = low.toIterator.zip(high.toIterator)
+    override def toString = factorise().mkString("x")
 
-    def dim() = high.length
+    def dimension() = high.length
 
     def centre(along : Axis) : Double =
       (high(along) + low(along))/2
@@ -74,18 +70,30 @@ object ScalaDensity {
 
     def volume() : Volume =
       ((high, low).zipped map (_-_)) reduce (_*_)
+
+    def contains(v : MLVector) =
+      (high, low, v.toArray).zipped.forall { case (h, l, c) => h >= c && c >= l }
+
+    def isLeftOfCentre(along : Axis, v : MLVector) : Boolean =
+      v(along) <= centre(along)
+
+    def isRightOfCentre(along : Axis, v : MLVector) : Boolean =
+      v(along) >  centre(along)
   }
 
   def hull(b1 : Rectangle, b2 : Rectangle) : Rectangle =
     Rectangle( ( b1.low, b2.low ).zipped map min,
                (b1.high, b2.high).zipped map max )
 
-  def point(v : MLVector) : Rectangle = Rectangle(v.toArray, v.toArray)
+  def point(v : MLVector) : Rectangle =
+    Rectangle(v.toArray, v.toArray)
 
   def boundingBox(vs : RDD[MLVector]) : Rectangle =
     vs.map(point(_)).reduce(hull)
 
   // (The) infinite binary tree
+
+  type Depth = Int
 
   case class NodeLabel(lab : BigInt) {
     private val rootLabel : BigInt = 1
@@ -94,8 +102,6 @@ object ScalaDensity {
     def   right() : NodeLabel = NodeLabel(2*lab + 1)
     def isRight() : Boolean   =  lab.testBit(0)
     def  isLeft() : Boolean   = !lab.testBit(0)
-
-    def depth() : Int = lab.bitLength - 1
 
     // WARNING: Not checking to make sure we're sufficiently deep
     def ancestor(level : Int) : NodeLabel = NodeLabel(lab >> level)
@@ -108,541 +114,401 @@ object ScalaDensity {
 
     def ancestors() : Stream[NodeLabel] =
       Stream.iterate(this)({_.parent}).takeWhile(_.lab >= rootLabel).tail
+
+    def depth() : Depth = lab.bitLength - 1
+    def truncate(toDepth : Depth) : NodeLabel = {
+      val fromDepth = depth()
+      if(toDepth >= fromDepth) this else ancestor(fromDepth - toDepth)
+    }
+
+    // Auxiliary stuff
+    def invert() : NodeLabel =
+      NodeLabel(lab ^ ((1 << (lab.bitLength-1)) - 1))
+    def initialLefts() : Int =
+      lab.bitLength - lab.clearBit(lab.bitLength-1).bitLength - 1
+    def initialRights() : Int =
+      invert().initialLefts
+
+    def mrsName() : String = (this #:: ancestors).reverse.flatMap {
+      case lab =>
+        if(lab == NodeLabel(rootLabel)) "X"
+        else if(lab.isLeft) "L"
+        else "R"
+    }.mkString
+
+    // def leftmostAncestor() : NodeLabel =
+    //   NodeLabel(1 << initialLefts())
+    // def rightmostAncestor() : NodeLabel =
+    //   NodeLabel((1 << (initialRights() + 1)) - 1)
   }
 
   val rootLabel : NodeLabel = NodeLabel(1)
 
-  def isAncestorOf(a : NodeLabel, b : NodeLabel) : Boolean =
-    a.lab < b.lab && (b.ancestor(b.depth - a.depth) == a)
+  object leftRightOrd extends Ordering[NodeLabel] {
+    def compare(a : NodeLabel, b : NodeLabel) = a.truncate(b.depth).lab compare b.truncate(a.depth).lab
+  }
 
-  def isDescendantOf(a : NodeLabel, b : NodeLabel) : Boolean = isAncestorOf(b, a)
+  def isAncestorOf(a : NodeLabel, b : NodeLabel) : Boolean =
+    a.lab < b.lab && leftRightOrd.compare(a, b) == 0
+
+  def isDescendantOf(a : NodeLabel, b : NodeLabel) : Boolean =
+    isAncestorOf(b, a)
+
+  def isLeftOf(a : NodeLabel, b : NodeLabel) : Boolean =
+    leftRightOrd.compare(a, b) < 0
+
+  def isRightOf(a : NodeLabel, b : NodeLabel) : Boolean =
+    isLeftOf(b, a)
+
+  def adjacent(a : NodeLabel, b : NodeLabel) : Boolean =
+    a.parent == b || b.parent == a
+
+  def join(a : NodeLabel, b : NodeLabel) : NodeLabel = {
+    val d = min(a.depth, b.depth)
+    val aT = a.truncate(d)
+    val bT = b.truncate(d)
+    aT.ancestor((aT.lab ^ bT.lab).bitLength)
+  }
+
+  def path(from : NodeLabel, to : NodeLabel) : Stream[NodeLabel] = {
+    if(from == to) {
+      Stream.empty
+    } else if(isDescendantOf(from, to)) {
+      from.ancestors.takeWhile(_.lab > to.lab)
+    } else if(isAncestorOf(from, to)) {
+      (from.depth + 1 until to.depth).toStream.map(to.truncate(_))
+    } else {
+      val j = join(from, to)
+      path(from, j) #::: Stream(j) #::: path(j, to)
+    }
+  }
+
+  def unfoldTree[A](base : A)(left : (NodeLabel, A) => A, right : (NodeLabel, A) => A)(lab : NodeLabel) : A = {
+    if(lab == rootLabel) {
+      base
+    } else if(lab.isLeft) {
+      left(lab, unfoldTree(base)(left, right)(lab.parent))
+    } else {
+      right(lab, unfoldTree(base)(left, right)(lab.parent))
+    }
+  }
+
+  case class CachedUnfoldTree[A]( base : A,
+                                 cache : Map[NodeLabel, A],
+                                  left : (NodeLabel, A) => A,
+                                 right : (NodeLabel, A) => A) {
+    def apply(lab : NodeLabel) : A = {
+      if(lab == rootLabel) base
+      else {
+        cache.get(lab) match {
+          case Some(x) => x
+          case None =>
+            if(lab.isLeft)
+              left(lab, this(lab.parent))
+            else
+              right(lab, this(lab.parent))
+        }
+      }
+    }
+
+    def recache(at : Iterable[NodeLabel]) : CachedUnfoldTree[A] =
+      CachedUnfoldTree(base,
+                       at.map(lab => (lab, this(lab))).toMap,
+                       left,
+                       right)
+  }
+
+  def unfoldTreeCached[A](base : A)(left : (NodeLabel, A) => A, right : (NodeLabel, A) => A) : CachedUnfoldTree[A] =
+    CachedUnfoldTree(base, Map.empty, left, right)
+
+  // gives a minimal sequence of nodes between a and b such that any path
+  // passing between a and b intersects at least once of these nodes, includes
+  // neither a nor b
 
   // Leaf-labelled finite (truncated) binary trees
 
-  case class TruncatedTree[A](leafValues : Map[NodeLabel, A]) {
-    // Warning: Will just fail if `at` is not currently a leaf node
-    def splitLeaf(at : NodeLabel, by : A => (A, A)) : TruncatedTree[A] = {
-      val (lvalue, rvalue) = by(leafValues(at))
-      TruncatedTree(leafValues - at + (at.left -> lvalue, at.right -> rvalue))
-    }
+  // TODO: Can we make efficient splices part of Truncation instead?
+  case class Subset(lower : Int, upper : Int) {
+    def size() : Int = upper - lower
+    def isEmpty() : Boolean = size() == 0
+  }
 
-    def leafNodes() : Set[NodeLabel] = leafValues.keySet
-    def hasLeaf(at : NodeLabel) : Boolean = leafValues.isDefinedAt(at)
-    // WARNING: Does no checking
-    def leafValue(lab : NodeLabel) : A = leafValues(lab)
+  type Walk = Stream[NodeLabel]
 
-    def leaves() : List[(NodeLabel, A)] = leafValues.toList
+  case class Truncation(leaves : Array[NodeLabel]) {
+    // TODO: Make this a more efficent binary search
+    def subtreeWithin(at : NodeLabel, within : Subset) : Subset = {
+      val mid = (within.lower until within.upper)
+        .dropWhile(i => isLeftOf(leaves(i), at))
+        .takeWhile(i => at == leaves(i) || isDescendantOf(leaves(i), at))
 
-    // WARNING: Does not check to make sure start is an internal node
-    // TODO: Turns this into a general traveral
-    def dftInternalFrom(start : NodeLabel) : Stream[NodeLabel] = {
-      def goRight(lab : NodeLabel) : Stream[NodeLabel] = {
-        if(!hasLeaf(lab.right)) {
-          goLeft(lab.right)
-        } else {
-          val Some(bt) = Stream.iterate(lab)(_.parent).find {
-            x =>
-            (x.isLeft && !hasLeaf(x.sibling)) || x == start
-          }
-
-          if(bt == start)
-            Stream.empty
-          else
-            goLeft(bt.sibling)
-        }
-      }
-
-      def goLeft(lab : NodeLabel) : Stream[NodeLabel] = {
-        lazy val next =
-          if(hasLeaf(lab.left))
-            goRight(lab)
-          else
-            goLeft(lab.left)
-
-        lab #:: next
-      }
-
-      if(hasLeaf(start))
-        Stream.empty
+      if(mid.length > 0)
+        Subset(mid.head, mid.last+1)
       else
-        goLeft(start)
+        Subset(0, 0)
     }
 
-    def dftInternal() : Stream[NodeLabel] = dftInternalFrom(rootLabel)
+    def allNodes() : Subset = Subset(0, leaves.length)
 
-    def mergeCherry(at : NodeLabel, by : (A, A) => A) : TruncatedTree[A] = {
-      val value = by(leafValues(at.left), leafValues(at.right))
-      TruncatedTree(((leafValues - at.left) - at.right) + (at -> value))
+    def subtree(at : NodeLabel) : Subset = subtreeWithin(at, allNodes())
+
+    def descend(labs : Walk) : Stream[Subset] =
+      labs.scanLeft(allNodes()) {
+        case (ss, lab) => subtreeWithin(lab, ss)
+      }.tail
+
+    // TODO: Optimise?
+    def descendUntilLeafWhere(labs : Walk) : (NodeLabel, Subset) =
+      labs.zip(descend(labs)).dropWhile{case (_, ss) => ss.size > 1}.head
+
+    def descendUntilLeaf(labs : Walk) : NodeLabel =
+      descendUntilLeafWhere(labs)._1
+
+    // NOTE: Computes the minimal tree containing the leaves of the truncation
+    def minimalCompletionNodes() : Stream[(NodeLabel, Option[Int])] = {
+      if(leaves.length == 0)
+        Stream((rootLabel, none()))
+      else {
+        // If necessary add a left/right-most leaf
+        val firstLeaf = leaves.head
+        val lastLeaf = leaves.last
+        val llim = firstLeaf.truncate(firstLeaf.initialLefts)
+        val rlim = lastLeaf.truncate(lastLeaf.initialRights)
+        val l : Stream[(NodeLabel, Option[Int])] = if(llim != firstLeaf) Stream((llim, none())) else Stream.empty
+        val r : Stream[(NodeLabel, Option[Int])] = if(rlim != lastLeaf) Stream((rlim, none())) else Stream.empty
+        val c : Stream[(NodeLabel, Option[Int])] = leaves.toStream.zip(0 until leaves.length).map(x => (x._1, some(x._2)))
+
+        val leavesWidened : Stream[(NodeLabel, Option[Int])] = l #::: c #::: r
+
+        val leavesFilled : Stream[(NodeLabel, Option[Int])] = leavesWidened.sliding(2).flatMap {
+          case ((llab, _) #:: (rlab, rval) #:: Stream.Empty) =>
+            val j = join(llab, rlab)
+            val upPath   = path(llab, j.left).filter(_.isLeft).map(x => (x.sibling, none()))
+            val downPath = path(j.right, rlab).filter(_.isRight).map(x => (x.sibling, none()))
+            upPath #::: downPath #::: Stream((rlab, rval))
+        }.toStream
+
+        leavesWidened.head #:: leavesFilled
+      }
+    }
+
+    def minimalCompletion() : Truncation =
+      Truncation(minimalCompletionNodes.map(_._1).toArray)
+  }
+
+  // WARNING: Currently does not check whether leaves can be a set of leaves
+  // (i.e. that it does not contain ancestor-descendant pairs)
+  def fromLeafSet(leaves : Iterable[NodeLabel]) : Truncation =
+    Truncation(leaves.toArray.sorted(leftRightOrd))
+
+  def rootTruncation() : Truncation = Truncation(Array(rootLabel))
+
+  def some[A](a : A) : Option[A] = Some(a)
+  def none[A]() : Option[A] = None
+
+  case class LeafMap[A](truncation : Truncation, vals : Array[A]) {
+    // TODO: Optimise?
+    def query(labs : Walk) : (NodeLabel, Option[A]) = {
+      val (at, ss) = truncation.descendUntilLeafWhere(labs)
+      if(ss.isEmpty) (at, none()) else (at, some(vals(ss.lower)))
+    }
+
+    def toMap() : Map[NodeLabel, A] =
+      truncation.leaves.zip(vals).toMap
+
+    def minimalCompletionNodes() : Stream[(NodeLabel, Option[A])] = {
+      // Figure out scalas weird do-notation equivalent
+      truncation.minimalCompletionNodes().map {
+        case (lab, None) => (lab, none())
+        case (lab, Some(i)) => (lab, some(vals(i)))
+      }
     }
   }
 
-  def rootTree[A](value : A) : TruncatedTree[A] =
-    TruncatedTree(Map(rootLabel -> value))
-
-  // Piecewise constant functions on binary spatial partitions
-
-  def descendSpatialTree(rootBox : Rectangle, point : MLVector) : Stream[(Rectangle, NodeLabel)] = {
-    val d = rootBox.dim
-
-    def step(box : Rectangle, lab : NodeLabel) : (Rectangle, NodeLabel) = {
-      val along = lab.depth % d
-
-      if(point(along) <= box.centre(along))
-        (box.lower(along),  lab.left)
-      else
-        (box.upper(along), lab.right)
-    }
-
-    Stream.iterate((rootBox, rootLabel))(Function.tupled(step))
+  def fromNodeLabelMap[A:ClassTag](xs : Map[NodeLabel, A]) : LeafMap[A] = {
+    val (labs, vals) = xs.toArray.sortWith({case(x,y) => isLeftOf(x._1, y._1)}).unzip
+    LeafMap(Truncation(labs), vals)
   }
 
-  case class PCFunction[A](rootBox : Rectangle, partition : TruncatedTree[(Rectangle, A)]) {
-    private def queryNode(point : MLVector) : NodeLabel =
-      descendSpatialTree(rootBox, point).map(_._2).dropWhile(!partition.hasLeaf(_)).head
+  ////////
 
-    private def valueAtNode(lab : NodeLabel) : (Rectangle, A) = partition.leafValue(lab)
+  // TODO: Can we figure out some clever way to do memoisation/caching?
+  case class SpatialTree(rootCell : Rectangle) {
+    def dimension() : Int = rootCell.dimension
 
-    def apply(point : MLVector) : (NodeLabel, Rectangle, A) = {
-      val lab = queryNode(point)
-      val (box, a) = valueAtNode(lab)
-      (lab, box, a)
-    }
+    def volumeTotal() : Double = rootCell.volume
 
-    def splitCell(at : NodeLabel, by : A => (A, A)) : PCFunction[A] = {
-      val along = at.depth % rootBox.dim
+    def volumeAt(at : NodeLabel) : Double =
+      rootCell.volume / pow(2, at.depth)
 
-      def actualBy(box : Rectangle, value : A) : ((Rectangle, A), (Rectangle, A)) = {
-        val (lvalue, rvalue) = by(value)
-        val (lbox, rbox) = box.split(along)
-        ((lbox, lvalue), (rbox, rvalue))
+    def axisAt(at : NodeLabel) : Int =
+      at.depth % dimension()
+
+    def cellAt(at : NodeLabel) : Rectangle =
+      unfoldTree(rootCell)((lab, box) => box.lower(axisAt(lab.parent)),
+                           (lab, box) => box.upper(axisAt(lab.parent)))(at)
+
+    def cellAtCached() : CachedUnfoldTree[Rectangle] =
+      unfoldTreeCached(rootCell)((lab, box) => box.lower(axisAt(lab.parent)),
+                                 (lab, box) => box.upper(axisAt(lab.parent)))
+
+    def descendBoxPrime(point : MLVector) : Stream[(NodeLabel, Rectangle)] = {
+      def step(lab : NodeLabel, box : Rectangle) : (NodeLabel, Rectangle) = {
+        val along = axisAt(lab)
+
+        if(box.isLeftOfCentre(along, point))
+          (lab.left, box.lower(along))
+        else
+          (lab.right, box.upper(along))
       }
 
-      PCFunction(rootBox, partition.splitLeaf(at, Function.tupled(actualBy)))
+      Stream.iterate((rootLabel, rootCell))(Function.tupled(step))
     }
 
-    def mergeCell(at : NodeLabel, by : (A, A) => A) : PCFunction[A] = {
-      def actualBy(lvals : (Rectangle, A), rvals : (Rectangle, A)) : (Rectangle, A) =
-        (hull(lvals._1, rvals._1), by(lvals._2, rvals._2))
-
-      PCFunction(rootBox, partition.mergeCherry(at, actualBy))
-    }
-
-    def cells() : List[(NodeLabel, Rectangle, A)] =
-      partition.leaves().map { case (k, (r, x)) => (k, r, x) }
+    def descendBox(point : MLVector) : Stream[NodeLabel] = descendBoxPrime(point).map(_._1)
   }
 
-  def constantPCFunction[A](rootBox : Rectangle, value : A) : PCFunction[A] =
-    PCFunction(rootBox, rootTree((rootBox, value)))
+  def spatialTreeRootedAt(rootCell : Rectangle) : SpatialTree = SpatialTree(rootCell)
 
-  // Histograms
-
-  case class Histogram(total : Long, counts : PCFunction[Long]) {
-    def density(point : MLVector) : Double = {
-      val (_, box, count) = counts(point)
-      count / (box.volume * total)
+  case class Histogram(tree : SpatialTree, totalCount : Count, counts : LeafMap[Count]) {
+    def density(v : MLVector) : Double = {
+      counts.query(tree.descendBox(v)) match {
+        case (_, None) => 0
+        case (at, Some(c)) =>
+          c / (totalCount * tree.volumeAt(at))
+      }
     }
   }
 
-  // type InfiniteTree[T] = NodeLabel => T
-  // type FiniteTree[T] = Map[NodeLabel, T]
-  // type Leaves[T] = Map[NodeLabel, T]
-  // type Internal[T] = Map[NodeLabel, T]
-
-  // // Partitions
-
-  // // TODO: Clarify (or make explicitly "undefined") semantics of points outside
-  // // the root bounding box
-
-  // // TODO: Make FiniteParition a trait with the queryPart method
-
-  // // A cell is nothing but its bounding rectangle
-  // case class Cell(bound : Rectangle)
-  // // A SplitCell is a rectangle split into two parts by a axis-parallel hyperplane
-  // case class SplitCell(bound : Rectangle, axis : Axis, intercept : Intercept) {
-  //   def toCell() : Cell = Cell(bound)
-  // }
-
-  // // WARNING: No checking is ever done to make sure leaves are the actual leaves!
-  // // NOTE: This is a simple, compact representation of TruncatedSplitPartition that can
-  // //       be sent to spark workers
-  // case class FiniteSplitPartition(splits : FiniteTree[SplitCell], leaves : Leaves[Cell]) {
-  //   def queryPart(v : MLVector) : NodeLabel = {
-  //     var node = rootLabel
-  //     while(splits.isDefinedAt(node)) {
-  //       val cell = splits(node)
-  //       if(v(cell.axis) < cell.intercept) {
-  //         node = left(node)
-  //       } else {
-  //         node = right(node)
-  //       }
-  //     }
-  //     node
-  //   }
-  // }
-
-  // // A finite partition defined by truncating a binary splitting tree at some leaf nodes
-  // case class TruncatedSplitPartition(splits : InfiniteTree[SplitCell], leaves : Leaves[Cell]) {
-  //   def toFinite() : FiniteSplitPartition = {
-  //     // TODO: Figure out if there is a tie-the-knot way to recursively
-  //     //       define immutable Maps in Scala
-  //     var truncSplits = MMap()
-  //     for(leaf <- leaves.keySet) {
-  //       for(lab <- ancestors(leaf).takeWhile(!truncSplits.isDefinedAt(_)))
-  //         truncSplits += (lab, splits(lab))
-  //     }
-  //     // Freeze mutable map, sadly there appears to be no more efficent way to do it
-  //     FiniteSplitPartition(truncSplits.toMap, leaves)
-  //   }
-
-  //   def queryPart(v : MLVector) : NodeLabel = {
-  //     var node = rootLabel
-  //     while(!leaves.isDefinedAt(node)) {
-  //       val cell = splits(node)
-  //       if(v(cell.axis) < cell.intercept) {
-  //         node = left(node)
-  //       } else {
-  //         node = right(node)
-  //       }
-  //     }
-  //     node
-  //   }
-
-  //   def extend() : InfiniteSplitPartition = InfiniteSplitPartition(splits)
-
-  //   // WARNING: No checking is done to make sure oldLeaves is a subset of leaves!
-  //   def splitLeaves(oldLeaves : Set[NodeLabel]) : TruncatedSplitPartition = {
-  //     val newLeaves = leafSet.flatMap(x => Set(left(x), right(x)))
-  //     TruncatedSplitPartition(splits, (leaves -- oldLeaves) ++ newLeaves)
-  //   }
-
-  //   // WARNING: No checking is done to ensure that lab is a cherry!
-  //   def truncateCherry(lab : NodeLabel) : TruncatedSplitPartition =
-  //     TruncatedSplitPartition(splits, (leaves -- Set(left(lab), right(lab))) ++ (lab, splits(lab)))
-  // }
-
-  // // An InfiniteSplitPartition defines a partitioning schemes by specifying splitting hyperplanes
-  // case class InfiniteSplitPartition(splits : InfiniteTree[SplitCell]) {
-  //   def truncate(leafset : Set[NodeLabel]) : TruncatedSplitPartition =
-  //     TruncatedSplitPartition(splits, leafset.map(leaf => (leaf, splits(leaf).toCell)).toMap)
-  //   def truncate() : TruncatedSplitPartition = truncate(Set(rootLabel))
-  // }
-
-  // // TODO: Compare memory use and performance with non-caching version
-  // // TODO: Maybe there's some more clever memoizing version that only keeps recently used keys?
-  // // A partitioning scheme given by recursively cutting rectangles in half, cycling through all axes
-  // def binarySplitTree(bbox : Rectangle) : InfiniteSplitPartition = {
-  //   val d = bbox.dim
-
-  //   // Tree that caches bounding box and depth of every node
-  //   lazy val t : InfiniteTree[(Rectangle, Int, Volume)] =
-  //     Memo.mutableHashMapMemo {
-  //       case `rootLabel` => (bbox, bbox.centre(0), 0)
-  //       case n =>
-  //         val (pbox, paxis, pintercept) = t(parent(n))
-  //         val box =
-  //           if(isRight(n))
-  //             pbox.upper(paxis, pintercept)
-  //           else
-  //             pbox.lower(paxis, pintercept)
-  //           val axis = (paxis + 1) % d
-  //           (box, axis, box.centre(axis))
-  //     }
-
-  //   return (lab => t(lab) match { case (r, a, x) => SplitCell(r, a, x) })
-  // }
-
-  // // Histograms and filtrations of histograms
-
-  // type Count = Long
-  // def densityFormula(c : Count, v : Volume, n : Count) : Double = c/(v * n)
-
-  // // WARNING: counts will only contain the non-zero counts!
-  // // TODO: Parameterise Histogram over the partition type once its given a trait
-  // // A histogram is a (finite) partition combined with Count labels for each part
-  // case class Histogram( partition : TruncatedSplitPartition,
-  //                       total : Count,
-  //                       counts : Leaves[Count] ) {
-
-  //   // WARNING: Does not check that lab is a leaf!
-  //   def densityAtNode(lab : NodeLabel) : Double =
-  //     densityFormula(counts(lab), partition.splits(lab).bound.volume, total)
-
-  //   // Gives the density given by the histogram at point p
-  //   def density(p : MLVector) : Double =
-  //     densityAtNode(partition.queryPart(p))
-
-  //   // NOTE: This is only approximate since we do not collapse cherries
-  //   //       that no longer satisfy the splitting criterion after removing
-  //   //       the point.
-  //   // ALmost computes the standard leave one out L2 error estimate
-  //   def looL2ErrorApprox() : Double = {
-  //     counts.map {
-  //       (x : NodeLabel, c : Count) =>
-  //       // val c = counts(x)
-  //       val v = partition.splits(x).bound.volume
-  //   	  val dtotsq = (c/total)*(c/total)/v // (c/(v*total))^2 * v
-  //       val douts = c*(c-1)/(v*(total - 1)*total) // 1/total * (c-1)/(v*(total-1)) * c
-  //       dtotsq - 2*douts
-  //     }.sum
-  //   }
-
-  //   def logQuasiLik() : Double =
-  //     counts.map {
-  //       // val c = counts(x)
-  //       case (x, c) => if(c == 0) 0 else c*log(densityAtNode(x))
-  //     }.sum
-
-  //   def logPenalisedQuasiLik(taurec : Double) : Double =
-  //     log(exp(taurec) - 1) - counts.size*taurec + logQuasiLik()
-
-  //   // NOTE: Warning, does not check to make sure something is a cherry!
-  //   def cutCherry(lab : BigInt) : Histogram = {
-  //     val cherryCount = counts.getOrElse(left(lab), 0) + counts.getOrElse(right(lab), 0)
-  //     Histogram(partition.truncateCherry(lab), total, (counts -- children(lab)) ++ (lab, cherryCount))
-  //   }
-
-  //   // TODO: Make this lazy?
-  //   def completeCounts() : FiniteTree[Count] = {
-  //     var currCounts = MMap(counts.toSeq: _*)
-  //     for((lab, c) <- counts) {
-  //       for(labanc <- ancestors(lab)) {
-  //         currCountsb.update(labanc, currCountsb.getOrElse(labanc, 0) + c)
-  //       }
-  //     }
-  //     currCounts.toMap
-  //   }
-
-  //   // TODO: Change this so as to take an ordering on (NodeLabel, Count, Volume) instead?
-  //   def backtrack[H](prio : (NodeLabel, Count, Volume) => H)(implicit ord : Ordering[H])
-  //       : Stream[(NodeLabel, Histogram)] = {
-
-  //     // Rewrite this in terms of PartialOrder[NodeLabel] and lexicographic order
-  //     object BacktrackOrder extends Ordering[(H, NodeLabel)] {
-  //       def compare(x : (H, NodeLabel), y : (H, NodeLabel)) = {
-  //         val (xH, xLab) = x
-  //         val (yH, yLab) = y
-  //         if(isAncestorOf(xLab, yLab)) 1
-  //         else if(isAncestorOf(yLab, xLab)) -1
-  //         else ord.compare(xH, yH)
-  //       }
-  //     }
-
-  //     var q = new PriorityQueue()(BacktrackOrder.reverse)
-
-  //     // TODO: There should be a nicer way to do this
-  //     val allcounts = completeCounts()
-
-  //     depthFirst(h.splits.leaves).foreach {
-  //       case lab =>
-  //         q += ((prio(lab, allcounts(lab), parition.splits(lab).bound.volume), lab))
-  //     }
-
-  //     val sorted : Stream[(H, NodeLabel)] = q.dequeueAll
-  //     sorted.scanLeft((BigInt(0), h)) {
-  //       // NOTE: This results in two extra lookups, but is nicer API-wise
-  //       case ((_, hc), (_, lab)) => (lab, cutCherry(hc, lab))
-  //     }.tail
-  //   }
-  // }
-
-  // // Rule to decide whether or not to split a cell based on count and bounding box
-  // type SplitRule = (Count, Rectangle) => Boolean
-
-  // // Just dumps any additional information that may be useful
-  // case class Refinements(leavesSplit : Set[NodeLabel], counts : Leaves[Count])
-
-  // case class PartitionedPoints( partition : TruncatedSplitPartition,
-  //                                   cells : RDD[(NodeLabel, MLVector)] ) {
-
-  //   def refineWithUpdates(splitrule : SplitRule) : (PartitionedPoints, Refinements) = {
-  //     val counts = cells.countByKey()
-
-  //     val oldLeaves = counts.filter {
-  //       case (lab, count) =>
-  //         splitrule(count, partition.leaves(lab).bound)
-  //     }.keySet
-
-  //     val newPartition = partition.splitLeaves(oldLeaves)
-
-  //     // NOTE: This is a compact representation that can serialised and sent to
-  //     // spark workers
-  //     // TODO: Benchmark Map vs HashMap vs ... since this is just a temporary
-  //     // structure we're free to use anything serialisable
-  //     val splits = oldLeaves.map {
-  //       case lab =>
-  //         val cell = partition.splits(lab)
-  //         (lab, (cell.axis, cell.intercept))
-  //     }.toMap
-
-  //     val newCells = cells.map {
-  //       case (k : NodeLabel, v : MLVector) =>
-  //         splits.get(k) match {
-  //           case Some((axis, intercept)) =>
-  //             if(v(axis) < intercept) {
-  //               (left(k), v)
-  //             } else {
-  //               (right(k), v)
-  //             }
-  //           case None =>
-  //             (k, v)
-  //         }
-  //     }
-
-  //     (PartitionedPoints(newPartition, newCells), Refinements(oldLeaves, counts))
-  //   }
-
-  //   def refine(splitrule : SplitRule) : PartitionedPoints = refineWithUpdates(stoprule)._1
-  // }
-
-  // // TODO: Move this into TruncatedSplitPartition
-  // def partitionPoints( points : RDD[MLVector],
-  //                   partition : TruncatedSplitPartition) :
-  //     PartitionedPoints = {
-  //   // NOTE: FiniteSplitPartition can be serialised and sent to workers
-  //   val finitePartition = partition.toFinite()
-  //   PartitionedPoints(truncated, points.map(x => (finitePartition.queryPart(x), x)))
-  // }
-
-  // // TODO: Taking both Histogram and Points separately makes little semantic
-  // // sense, but I don't want to define yet another class like
-  // // "populatedHistogram" or similar...
-  // // TODO: Change this to just take partitioned points and recount, this also enables us to
-  // // switch to a different set of points and makes more semantic sense
-  // def histogramFromSplitUntil( partitioned : PartitionedPoints,
-  //                                splitrule : SplitRule ) :
-  //     (Histogram, PartitionedPoints) = {
-  //   var currentPartitioned = partitioned
-  //   var currentCounts = MMap.empty
-  //   do {
-  //     // case class Refinements(leavesSplit : Set[NodeLabel], counts : Leaves[Count])
-  //     val (newPartitioned, refinements) = partitionedPoints.refineWithUpdates(splitrule)
-  //     currentPartitioned = newPartitioned.localCheckpoint()
-  //     currentCounts = refinements.counts
-  //   } while(!refinements.leavesSplit.isEmpty)
-  //   (Histogram(currentPartitioned.partition, currentCounts.toMap), currentPartitioned)
-  // }
-
-  // def histogramSplitUntil( points : RDD[MLVector],
-  //                       partition : InfiniteSplitPartition,
-  //                       splitrule : SplitRule ) :
-  //     (Histogram, PartitionedPoints) = {
-  //   val partitioned = partitionPoints(points, partition.truncate())
-  //   histogramFromSplitUntil(partitioned, splitrule)
-  // }
-
-  // // Compute histogram given volume and count bounds
-  // def histogram( points : RDD[MLVector],
-  //             partition : InfiniteSplitPartition,
-  //             minPoints : Count,
-  //                minVol : Volume ) : Histogram = {
-  //   def splitrule(count : Count, box : Rectangle) : Boolean =
-  //     (count >= minPoints) && (box.volume > minVol)
-  //   histogramSplitUntil(points, partition, splitRule)._1
-  // }
-
-  // def histograms( points : RDD[MLVector],
-  //              partition : InfiniteSplitPartition,
-  //              minPoints : Count,
-  //                 minVol : Volume ) : Stream[Histogram] = {
-  //   val hBase = histogram(points, partition, minPoints, minVol)
-
-  //   val n = hBase.total
-
-  //   def joinPrio(lvl : Int, lab : NodeLabel, c : Count, v : Volume) : Count = c
-
-  //   hBase #:: backtrack(hBase, joinPrio)(Ordering[Count].reverse).map(_._2)
-  // }
-
-  // def supportCarvedHistogram( points : RDD[MLVector],
-  //                          partition : InfiniteSplitPartition,
-  //                     splitThreshold : Double ) :
-  //     Histogram = {
-  //   val n = points.count()
-  //   // TODO: Factor this out
-  //   def splitrule(count : Count, box : Rectangle) : Boolean =
-  //     (count == n) | ((1 - c/n) * box.volume >= splitThreshold)
-  //   histogramSplitUntil(points, partition, splitRule)
-  // }
-
-  // def supportCarvedHistograms( points : RDD[MLVector],
-  //                           partition : InfiniteSplitPartition,
-  //                      splitThreshold : Double ) :
-  //     Stream[Histogram] = {
-
-  //   val volumeThreshold = 0.000000001
-  //   val hBase = supportCarvedHistogram(points, partition, splitThreshold)
-
-  //   val n = hBase.total
-
-  //   def joinPrio(lvl : Int, lab : NodeLabel, c : Count, v : Volume) : Double =
-  //     (1 - c/n)*v
-
-  //   hBase #:: backtrack(hBase, joinPrio)(Ordering[Double].reverse).map(_._2)
-  // }
-
-  // def runTemp( points : RDD[MLVector],
-  //           partition : InfiniteSplitPartition,
-  //      carveThreshold : Double,
-  //      countThreshold : Count,
-  //                 tau : Double ) : Histogram = {
-  //   val minVol = 0.00001
-
-  //   val optFromRoot = histograms(points, partition, countThreshold, minVol).
-  //     min(Ordering[?????].on(?????))
-
-  //   val carvedPartition =
-  //     supportCarvedHistograms(points, partition, carveThreshold).
-  //       min(Ordering[Double].on(logPenalisedQuasiLik(_, 1/tau))).
-  //       partition
-
-  //   def splitrule(count : Count, box : Rectangle) : Boolean =
-  //     (count >= countThreshold) && (box.volume > minVol)
-
-  //   val optFromCarved = histogramFromSplitUntil(partitionPoints(points, carvedPartition), splitrule).
-  //     takeWhile(_ != carvedPartition).
-  //     min(Ordering[?????].on(?????))
-
-  //   if(???(optFromCarved) ? ???(optFromRoot))
-  //     optFromCarved
-  //   else
-  //     optFromRoot
-  // }
-
-  // // def dumpHist(df : RDD[MLVector], h : Histogram, path : String) : Unit =
-  // //   Files.write(
-  // //     Paths.get(path),
-  // //     Vegas("Histogram").
-  // //       withData( df.collect().toSeq.map(x =>
-  // //                  Map("x" -> x(0), "y" -> x(1),
-  // //                      "d" -> density(h, Vectors.dense(x(0), x(1))),
-  // //                      "n" -> queryPart(h, Vectors.dense(x(0), x(1)))
-  // //                  )
-  // //                ) ).
-  // //       encodeX("x", Quant).
-  // //       encodeY("y", Quant).
-  // //       encodeOpacity("d", Quantitative).
-  // //       // encodeColor("n", Nom).
-  // //       mark(Point).
-  // //       html.pageHTML().getBytes(StandardCharsets.UTF_8))
-
-  // // def enumerate[A](xs : Stream[A]) : Stream[(Int, A)] =
-  // //   (Stream.from(1), xs).zipped.toStream
-
-  // def main(args: Array[String]) = {
-  //   Logger.getLogger("org").setLevel(Level.ERROR)
-  //   Logger.getLogger("akka").setLevel(Level.ERROR)
-  //   val conf = new SparkConf().setAppName("ScalaDensity").setMaster("local[2]")
-  //   val sc = new SparkContext(conf)
-
-  //   val n = 200
-  //   val df = normalVectorRDD(sc, n, 2)
-  //   val partition = binarySplitTree(boundingBox(df))
-
-  //   for(temp <- Array(0.5, 1, 2)) {
-  //     println(temp)
-  //     println(runTemp(df, partition, 0.005, 10, temp).looL2ErrorApprox())
-  //   }
-
-  //   sc.stop()
-  // }
+  ////////
+
+  type Count = Long
+
+  // TODO: This should maybe be parameterised over Count/countByKey as well
+  case class Partitioned[A](points : RDD[(NodeLabel, A)]) {
+    def splittable(shouldSplit : (NodeLabel, Count) => Boolean) : (Map[NodeLabel, Count], Map[NodeLabel, Count]) =
+      // TODO: Why is keyBy needed, it should be noop here?!?
+      points.keyBy(_._1).countByKey().toMap.partition(Function.tupled(shouldSplit))
+
+    def subset(labs : Set[NodeLabel]) : Partitioned[A] =
+      Partitioned(points.filter(x => labs(x._1)))
+
+    def split(rule : (NodeLabel, A) => NodeLabel) : Partitioned[A] =
+      Partitioned(points.map{case(lab, v) => (rule(lab, v), v)})
+
+    def count() : Long = points.count()
+  }
+
+  def partitionPoints(tree : SpatialTree, trunc : Truncation, points : RDD[MLVector]) : Partitioned[MLVector] =
+    Partitioned(points.map(x => (trunc.descendUntilLeaf(tree.descendBox(x)), x)))
+
+  type SplitLimits = (Volume, Count) => (Int, Volume, Count) => Boolean
+
+  // TODO: Ensure that the resulting NodeLabel is a refinement of tree
+  // TODO: !!! Figure out if we need to explicitly persist stuff
+  def splitAndCountFrom(  tree : SpatialTree,
+                         trunc : Truncation,
+                        points : RDD[MLVector],
+                        limits : SplitLimits) : Map[NodeLabel, Count] = {
+    var accCounts : HashMap[NodeLabel, Count] = HashMap()
+    var boxCache = tree.cellAtCached()
+    // println("Partitioning points...")
+    var partitioned : Partitioned[MLVector] = partitionPoints(tree, trunc, points)
+
+    val  totalCount = points.count
+    val totalVolume = tree.volumeTotal
+    val   splitRule = limits(totalVolume, totalCount)
+
+    // Apparently the block inside a do-while loop is out of scope in the
+    // stopping criterion, I love Scala so much...
+    var scalaplease : Map[NodeLabel, Count] = null
+    do {
+      val (doSplit, dontSplit) = partitioned.splittable((lab, c) => splitRule(lab.depth, tree.volumeAt(lab), c))
+      scalaplease = doSplit
+
+      accCounts ++= dontSplit
+      boxCache = boxCache.recache(doSplit.keySet)
+
+      val splitPlanes : Map[NodeLabel,(Int,Double)] = boxCache.cache.map{case(l,v)=>(l, (tree.axisAt(l), boxCache(l).centre(tree.axisAt(l))))}
+
+      partitioned = partitioned.subset(doSplit.keySet).split {
+        case (lab, x) =>
+          val (along, centre) = splitPlanes(lab)
+          if(x(along) <= centre) lab.left else lab.right
+      }
+    } while(!scalaplease.isEmpty)
+
+    accCounts.toMap
+  }
+
+  def histogramFrom(tree : SpatialTree, trunc : Truncation, points : RDD[MLVector], limits : SplitLimits) : Histogram = {
+    val counts = splitAndCountFrom(tree, trunc, points, limits)
+    val totalCount = counts.values.sum
+    Histogram(tree, totalCount, fromNodeLabelMap(counts))
+  }
+
+  def histogram(points : RDD[MLVector], limits : SplitLimits) : Histogram =
+    histogramFrom(spatialTreeRootedAt(boundingBox(points)),
+                  rootTruncation, points, limits)
+
+  def main(args: Array[String]) = {
+    Logger.getLogger("org").setLevel(Level.ERROR)
+    Logger.getLogger("akka").setLevel(Level.ERROR)
+    val conf = new SparkConf().setAppName("ScalaDensity").setMaster("local[2]")
+    val sc = new SparkContext(conf)
+
+    val n = 200
+    val df = normalVectorRDD(sc, n, 2)
+
+    def limits(totalVolume : Double, totalCount : Count)(depth : Int, volume : Volume, count : Count) =
+      count > n/2 || (1 - count/totalCount)*volume/totalVolume > 0.1
+
+    val h = histogram(df, limits)
+
+    // Print the root box
+    println("Root box")
+    h.tree.rootCell.factorise.foreach {
+      case (l, u) => println(List("[",l,",",u,"]").mkString)
+    }
+
+    println("Total count")
+    println(h.totalCount)
+
+    // Print depths
+    println("Depths")
+    h.counts.minimalCompletionNodes.foreach {
+      case (lab, _) => println(lab.depth)
+    }
+
+    // Print counts
+    println("Counts")
+    h.counts.minimalCompletionNodes.foreach {
+      case (_, None) => println(0)
+      case (_, Some(c)) => println(c)
+    }
+
+    // Print Volume
+    println("Volume")
+    h.counts.minimalCompletionNodes.foreach {
+      case (lab, _) => println(h.tree.volumeAt(lab))
+    }
+
+    // Print Probability
+    println("Probability")
+    h.counts.minimalCompletionNodes.foreach {
+      case (_, None)    => println(0)
+      case (_, Some(c)) => println(c.toDouble/h.totalCount)
+    }
+
+    // Print Density
+    println("Density")
+    h.counts.minimalCompletionNodes.foreach {
+      case (_, None)      => println(0)
+      case (lab, Some(c)) => println(c/(h.tree.volumeAt(lab) * h.totalCount))
+    }
+
+    // println(fullTree)
+
+    sc.stop()
+  }
 }

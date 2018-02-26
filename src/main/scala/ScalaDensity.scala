@@ -467,7 +467,8 @@ object ScalaDensity {
 
     // Print the root box
     println("Root box")
-    h.tree.rootCell.factorise.foreach {
+    val rootbox = h.tree.rootCell.factorise
+    rootbox.foreach {
       case (l, u) => println(List("[",l,",",u,"]").mkString)
     }
 
@@ -476,36 +477,41 @@ object ScalaDensity {
 
     // Print depths
     println("Depths")
-    h.counts.minimalCompletionNodes.foreach {
-      case (lab, _) => println(lab.depth)
+    val depths = h.counts.minimalCompletionNodes.map {
+      case (lab, _) => lab.depth
     }
+    depths.foreach(println(_))
 
     // Print counts
     println("Counts")
-    h.counts.minimalCompletionNodes.foreach {
-      case (_, None) => println(0)
-      case (_, Some(c)) => println(c)
+    val counts = h.counts.minimalCompletionNodes.map {
+      case (_, None) => 0
+      case (_, Some(c)) => c
     }
+    counts.foreach(println(_))
 
     // Print Volume
     println("Volume")
-    h.counts.minimalCompletionNodes.foreach {
-      case (lab, _) => println(h.tree.volumeAt(lab))
+    val volumes = h.counts.minimalCompletionNodes.map {
+      case (lab, _) => h.tree.volumeAt(lab)
     }
+    volumes.foreach(println(_))
 
     // Print Probability
     println("Probability")
-    h.counts.minimalCompletionNodes.foreach {
-      case (_, None)    => println(0)
-      case (_, Some(c)) => println(c.toDouble/h.totalCount)
+    val probabilities = h.counts.minimalCompletionNodes.map {
+      case (_, None)    => 0
+      case (_, Some(c)) => c.toDouble/h.totalCount
     }
+    probabilities.foreach(println(_))
 
     // Print Density
     println("Density")
-    h.counts.minimalCompletionNodes.foreach {
-      case (_, None)      => println(0)
-      case (lab, Some(c)) => println(c/(h.tree.volumeAt(lab) * h.totalCount))
+    val densities = h.counts.minimalCompletionNodes.map {
+      case (_, None)      => 0
+      case (lab, Some(c)) => c/(h.tree.volumeAt(lab) * h.totalCount)
     }
+    densities.foreach(println(_))
 
     // println(fullTree)
 

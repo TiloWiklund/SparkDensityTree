@@ -27,7 +27,7 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     Logger.getLogger("akka").setLevel(Level.ERROR)
     val conf = new SparkConf().setAppName("ScalaDensityTest").setMaster("local")
     sc = new SparkContext(conf)
-    df = normalVectorRDD(sc, dfnum, dfdim).persist()
+    df = normalVectorRDD(sc, dfnum, dfdim, 3, 7387389).persist()
     bb = boundingBox(df)
   }
 
@@ -198,15 +198,27 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
 
   it should "have completion be a finite tree" in {
     // TODO: Change this to some determinstic tree instead of hist!
-    def lims(tv : Volume, tc : Count)(d : Int, v : Volume, c : Count) : Boolean =
-      c > 100 || (1 - c/tc)*v/tv > 0.1
+    // def lims(tv : Volume, tc : Count)(d : Int, v : Volume, c : Count) : Boolean =
+    //   c > 100 || (1 - c/tc)*v/tv > 0.1
 
-    val h = histogram(df, lims)
+    // val h = histogram(df, lims)
 
-    val leaves = h.counts.truncation.leaves.toSet
+    // val leaves = h.counts.truncation.leaves.toSet
+
+
+    val leaves1 = Set(rootLabel.left.left.right, rootLabel.right.left)
+    val trunc = fromLeafSet(leaves1)
+    val leaves = trunc.minimalCompletion.leaves.toSet
+    // print("Start: ")
+    // println(leaves1)
+    // print("Completed: ")
+    // println(leaves)
+
     val d = leaves.map(_.depth).max + 1
     var nodes = Set(rootLabel)
     for(i <- 1 to d) {
+      // print("N: ")
+      // println(nodes)
       nodes = (nodes -- leaves).flatMap(x => Set(x.left, x.right))
     }
     assert(nodes === Set())

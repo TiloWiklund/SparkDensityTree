@@ -160,6 +160,12 @@ object ScalaDensity {
   def isRightOf(a : NodeLabel, b : NodeLabel) : Boolean =
     isLeftOf(b, a)
 
+  def inLeftSubtreeOf(a : NodeLabel, b : NodeLabel) : Boolean =
+    a == b.left || isAncestorOf(b.left, a)
+
+  def inRightSubtreeOf(a : NodeLabel, b : NodeLabel) : Boolean =
+    a == b.right || isAncestorOf(b.right, a)
+
   def adjacent(a : NodeLabel, b : NodeLabel) : Boolean =
     a.parent == b || b.parent == a
 
@@ -198,18 +204,37 @@ object ScalaDensity {
                                   left : (NodeLabel, A) => A,
                                  right : (NodeLabel, A) => A) {
     def apply(lab : NodeLabel) : A = {
-      if(lab == rootLabel) base
-      else {
-        cache.get(lab) match {
-          case Some(x) => x
-          case None =>
-            if(lab.isLeft)
-              left(lab, this(lab.parent))
-            else
-              right(lab, this(lab.parent))
+      val inCache : NodeLabel = (lab.ancestors.dropWhile(!cache.isDefinedAt(_)) #::: Stream(rootLabel)).head
+      val startWith : A = if(inCache == rootLabel) base else cache(inCache)
+
+      // TODO: Make this nicer
+      var clab = inCache
+      var result = startWith
+      while(clab != lab) {
+        val goLeft = inLeftSubtreeOf(lab, clab)
+        if(goLeft) {
+          clab = clab.left
+          result = left(clab, result)
+        } else {
+          clab = clab.right
+          result = right(clab, result)
         }
       }
+      result
     }
+    // def apply(lab : NodeLabel) : A = {
+    //   if(lab == rootLabel) base
+    //   else {
+    //     cache.get(lab) match {
+    //       case Some(x) => x
+    //       case None =>
+    //         if(lab.isLeft)
+    //           left(lab, this(lab.parent))
+    //         else
+    //           right(lab, this(lab.parent))
+    //     }
+    //   }
+    // }
 
     def recache(at : Iterable[NodeLabel]) : CachedUnfoldTree[A] =
       CachedUnfoldTree(base,
@@ -385,22 +410,26 @@ object ScalaDensity {
   type Count = Long
 
   // TODO: This should maybe be parameterised over Count/countByKey as well
-  case class Partitioned[A](points : RDD[(NodeLabel, A)]) {
-    def splittable(shouldSplit : (NodeLabel, Count) => Boolean) : (Map[NodeLabel, Count], Map[NodeLabel, Count]) =
+  case class Partitioned[A](points : RDD[(BigInt, A)]) {
+    def splittable(shouldSplit : (NodeLabel, Count) => Boolean) : (Map[NodeLabel, Count], Map[NodeLabel, Count]) = {
       // TODO: Why is keyBy needed, it should be noop here?!?
-      points.keyBy(_._1).countByKey().toMap.partition(Function.tupled(shouldSplit))
+      // NOTE: This is needed to make things work in SparkREPL/DB, and maybe save some space if Spark/Scala are dumb
+      points.keyBy(_._1).countByKey().toMap.map(x => (NodeLabel(x._1), x._2)).partition(Function.tupled(shouldSplit))
+    }
 
-    def subset(labs : Set[NodeLabel]) : Partitioned[A] =
-      Partitioned(points.filter(x => labs(x._1)))
+    def subset(labs : Set[NodeLabel]) : Partitioned[A] = {
+      val actualLabs = labs.map(_.lab)
+      Partitioned(points.filter(x => actualLabs(x._1)))
+    }
 
     def split(rule : (NodeLabel, A) => NodeLabel) : Partitioned[A] =
-      Partitioned(points.map{case(lab, v) => (rule(lab, v), v)})
+      Partitioned(points.map{case(l, v) => (rule(NodeLabel(l), v).lab, v)})
 
     def count() : Long = points.count()
   }
 
   def partitionPoints(tree : SpatialTree, trunc : Truncation, points : RDD[MLVector]) : Partitioned[MLVector] =
-    Partitioned(points.map(x => (trunc.descendUntilLeaf(tree.descendBox(x)), x)))
+    Partitioned(points.map(x => (trunc.descendUntilLeaf(tree.descendBox(x)).lab, x)))
 
   type SplitLimits = (Volume, Count) => (Int, Volume, Count) => Boolean
 
@@ -425,6 +454,10 @@ object ScalaDensity {
     do {
       val (doSplit, dontSplit) = partitioned.splittable((lab, c) => splitRule(lab.depth, tree.volumeAt(lab), c))
       scalaplease = doSplit
+
+      // println("LOOP")
+      // println(doSplit)
+      // println(dontSplit)
 
       accCounts ++= dontSplit
       boxCache = boxCache.recache(doSplit.keySet)
@@ -454,14 +487,16 @@ object ScalaDensity {
   def main(args: Array[String]) = {
     Logger.getLogger("org").setLevel(Level.ERROR)
     Logger.getLogger("akka").setLevel(Level.ERROR)
-    val conf = new SparkConf().setAppName("ScalaDensity").setMaster("local[2]")
+    val conf = new SparkConf().setAppName("ScalaDensity").setMaster("local[3]")//setMaster("spark://127.0.0.1:7077")
     val sc = new SparkContext(conf)
 
-    val n = 200
-    val df = normalVectorRDD(sc, n, 2)
+    val dfnum = 200
+    val dfdim = 2
+    // val df = normalVectorRDD(sc, n, 2)
+    val df = normalVectorRDD(sc, dfnum, dfdim, 3, 7387389)
 
     def limits(totalVolume : Double, totalCount : Count)(depth : Int, volume : Volume, count : Count) =
-      count > n/2 || (1 - count/totalCount)*volume/totalVolume > 0.1
+      count > dfnum/2 || (1 - count/totalCount)*volume/totalVolume > 0.1
 
     val h = histogram(df, limits)
 

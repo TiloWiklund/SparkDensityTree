@@ -135,11 +135,6 @@ object ScalaDensity {
         else if(lab.isLeft) "L"
         else "R"
     }.mkString
-
-    // def leftmostAncestor() : NodeLabel =
-    //   NodeLabel(1 << initialLefts())
-    // def rightmostAncestor() : NodeLabel =
-    //   NodeLabel((1 << (initialRights() + 1)) - 1)
   }
 
   val rootLabel : NodeLabel = NodeLabel(1)
@@ -222,19 +217,6 @@ object ScalaDensity {
       }
       result
     }
-    // def apply(lab : NodeLabel) : A = {
-    //   if(lab == rootLabel) base
-    //   else {
-    //     cache.get(lab) match {
-    //       case Some(x) => x
-    //       case None =>
-    //         if(lab.isLeft)
-    //           left(lab, this(lab.parent))
-    //         else
-    //           right(lab, this(lab.parent))
-    //     }
-    //   }
-    // }
 
     def recache(at : Iterable[NodeLabel]) : CachedUnfoldTree[A] =
       CachedUnfoldTree(base,
@@ -245,10 +227,6 @@ object ScalaDensity {
 
   def unfoldTreeCached[A](base : A)(left : (NodeLabel, A) => A, right : (NodeLabel, A) => A) : CachedUnfoldTree[A] =
     CachedUnfoldTree(base, Map.empty, left, right)
-
-  // gives a minimal sequence of nodes between a and b such that any path
-  // passing between a and b intersects at least once of these nodes, includes
-  // neither a nor b
 
   // Leaf-labelled finite (truncated) binary trees
 
@@ -331,15 +309,60 @@ object ScalaDensity {
   def some[A](a : A) : Option[A] = Some(a)
   def none[A]() : Option[A] = None
 
-  case class LeafMap[A](truncation : Truncation, vals : Array[A]) {
+  // TODO: Figure out something more efficient
+  // def cutArray[A:ClassTag](xs : Array[A], from : Int, to : Int) : Array[A] =
+  //   (xs.slice(0, from) ++ xs.slice(to, xs.length)).toArray
+
+  case class LeafMap[A:ClassTag](truncation : Truncation, vals : Array[A]) {
     // TODO: Optimise?
     def query(labs : Walk) : (NodeLabel, Option[A]) = {
       val (at, ss) = truncation.descendUntilLeafWhere(labs)
       if(ss.isEmpty) (at, none()) else (at, some(vals(ss.lower)))
     }
 
+    def toIterable() : Iterable[(NodeLabel, A)] = truncation.leaves.zip(vals)
+
+    def size() : Int = vals.size
+
+    def slice(ss : Subset) : Iterator[A] = vals.slice(ss.lower, ss.upper).toIterator
+
+    def mergeSubtree(at : NodeLabel, op : (A, A) => A) : LeafMap[A] = {
+      val ss = truncation.subtree(at)
+      if(ss.size == 0) this
+      else {
+        // println(ss.size)
+        val newLeaves = truncation.leaves.slice(0, ss.lower) ++ Seq(at) ++ truncation.leaves.slice(ss.upper, truncation.leaves.length)
+        // println(truncation.leaves.toList)
+        // println(newLeaves.toList)
+        val newVals = vals.slice(0, ss.lower) ++ Seq(slice(ss).reduce(op)) ++ vals.slice(ss.upper, vals.length)
+        // println(vals.toList)
+        // println(newVals.toList)
+        LeafMap(Truncation(newLeaves.toArray), newVals.toArray)
+      }
+    }
+
+    def leaves() : Array[NodeLabel] = truncation.leaves
+
     def toMap() : Map[NodeLabel, A] =
-      truncation.leaves.zip(vals).toMap
+      toIterable().toMap
+
+    // TODO: Figure out if this can be done more efficently
+    def internal(base : A, op : (A, A) => A) : Stream[(NodeLabel, A)] = {
+      def go(lab : NodeLabel, bound : Subset) : (A, Stream[(NodeLabel, A)]) = {
+        val newBound = truncation.subtreeWithin(lab, bound)
+        if(newBound.size == 0)
+          (base, Stream.empty)
+        else if(newBound.size == 1 && truncation.leaves(newBound.lower) == lab)
+          (vals(newBound.lower), Stream.empty)
+        else {
+          val (lacc, lseq) = go(lab.left, newBound)
+          val (racc, rseq) = go(lab.right, newBound)
+          val acc = op(lacc, racc)
+          (acc, (lab, acc) #:: lseq #::: rseq)
+        }
+      }
+      go(rootLabel, truncation.allNodes)._2
+    }
 
     def minimalCompletionNodes() : Stream[(NodeLabel, Option[A])] = {
       // Figure out scalas weird do-notation equivalent
@@ -395,6 +418,20 @@ object ScalaDensity {
 
   def spatialTreeRootedAt(rootCell : Rectangle) : SpatialTree = SpatialTree(rootCell)
 
+  // WARNING: Approx. because it does not merge cells where removing one point
+  // puts it below the splitting criterion
+  def looL2ErrorApproxFromCells(total : Count, cells : Iterable[(Volume, Count)]) : Double =
+    cells.map {
+      case (v : Volume, c : Count) =>
+        // (c/(v*total))^2 * v
+      	val dtotsq = (c/total)*(c/total)/v
+        // 1/total * (c-1)/(v*(total-1)) * c
+        val douts = c*(c-1)/(v*(total - 1)*total)
+        dtotsq - 2*douts
+    }.sum
+
+  type PriorityFunction[H] = (NodeLabel, Count, Volume) => H
+
   case class Histogram(tree : SpatialTree, totalCount : Count, counts : LeafMap[Count]) {
     def density(v : MLVector) : Double = {
       counts.query(tree.descendBox(v)) match {
@@ -402,6 +439,51 @@ object ScalaDensity {
         case (at, Some(c)) =>
           c / (totalCount * tree.volumeAt(at))
       }
+    }
+
+    def truncation() : Truncation = counts.truncation
+
+    def cells() : Iterable[(Volume, Count)] = counts.toIterable.map {
+      case (lab : NodeLabel, c : Count) => (tree.volumeAt(lab), c)
+    }
+
+    def looL2ErrorApprox() : Double = looL2ErrorApproxFromCells(totalCount, cells())
+
+    def logLik() : Double = counts.toIterable.map {
+        case (lab : NodeLabel, c : Count) => c*log(c/(totalCount * tree.volumeAt(lab)))
+    }.sum
+
+    def logPenalisedLik(taurec : Double) : Double =
+      log(exp(taurec) - 1) - counts.toIterable.size*taurec + logLik()
+
+    def backtrackNodes[H](prio : PriorityFunction[H])(implicit ord : Ordering[H])
+        : Stream[(NodeLabel, Count)] = {
+
+      // TODO: Rewrite this in terms of PartialOrder[NodeLabel] and lexicographic order
+      object BacktrackOrder extends Ordering[(H, NodeLabel, Count)] {
+        def compare(x : (H, NodeLabel, Count), y : (H, NodeLabel, Count)) = {
+          val (xH, xLab, _) = x
+          val (yH, yLab, _) = y
+          if(isAncestorOf(xLab, yLab)) 1
+          else if(isAncestorOf(yLab, xLab)) -1
+          else ord.compare(xH, yH)
+        }
+      }
+
+      var q = new PriorityQueue()(BacktrackOrder.reverse)
+      for((lab, cacc) <- counts.internal(0, _+_)) {
+        q += ((prio(lab, cacc, tree.volumeAt(lab)), lab, cacc))
+      }
+
+      q.dequeueAll.toStream.map({case (_, lab, c) => (lab, c)})
+    }
+
+    def backtrack[H](prio : PriorityFunction[H])(implicit ord : Ordering[H]) : Stream[Histogram] = {
+      backtrackNodes(prio).scanLeft(this) {
+        // NOTE: This results in two extra lookups, but is nicer API-wise
+        case (h : Histogram, (lab, _)) =>
+            Histogram(tree, totalCount, h.counts.mergeSubtree(lab, _+_))
+      }.tail
     }
   }
 
@@ -433,15 +515,20 @@ object ScalaDensity {
 
   type SplitLimits = (Volume, Count) => (Int, Volume, Count) => Boolean
 
+  type StopRule = (Volume, Count, Iterable[(Double, Count)]) => Boolean
+
+  def noEarlyStop(tv : Volume, tc : Count, cs : Iterable[(Double, Count)]) : Boolean = false
+  def boundLeaves(bound : Int) : StopRule = (tv : Volume, tc : Count, cs : Iterable[(Double, Count)]) => cs.size >= bound
+
   // TODO: Ensure that the resulting NodeLabel is a refinement of tree
   // TODO: !!! Figure out if we need to explicitly persist stuff
   def splitAndCountFrom(  tree : SpatialTree,
                          trunc : Truncation,
                         points : RDD[MLVector],
-                        limits : SplitLimits) : Map[NodeLabel, Count] = {
+                        limits : SplitLimits,
+                          stop : StopRule ) : Map[NodeLabel, Count] = {
     var accCounts : HashMap[NodeLabel, Count] = HashMap()
     var boxCache = tree.cellAtCached()
-    // println("Partitioning points...")
     var partitioned : Partitioned[MLVector] = partitionPoints(tree, trunc, points)
 
     val  totalCount = points.count
@@ -455,34 +542,36 @@ object ScalaDensity {
       val (doSplit, dontSplit) = partitioned.splittable((lab, c) => splitRule(lab.depth, tree.volumeAt(lab), c))
       scalaplease = doSplit
 
-      // println("LOOP")
-      // println(doSplit)
-      // println(dontSplit)
-
       accCounts ++= dontSplit
       boxCache = boxCache.recache(doSplit.keySet)
 
-      val splitPlanes : Map[NodeLabel,(Int,Double)] = boxCache.cache.map{case(l,v)=>(l, (tree.axisAt(l), boxCache(l).centre(tree.axisAt(l))))}
+      val splitPlanes : Map[NodeLabel,(Int,Double)] = boxCache.cache.map {
+        case (l,v) =>
+          (l, (tree.axisAt(l), boxCache(l).centre(tree.axisAt(l))))
+      }
 
       partitioned = partitioned.subset(doSplit.keySet).split {
         case (lab, x) =>
           val (along, centre) = splitPlanes(lab)
           if(x(along) <= centre) lab.left else lab.right
       }
-    } while(!scalaplease.isEmpty)
+    } while(!scalaplease.isEmpty && !stop(totalVolume, totalCount, accCounts.toIterable.map {case (l, c) => (tree.volumeAt(l), c)}))
 
     accCounts.toMap
   }
 
-  def histogramFrom(tree : SpatialTree, trunc : Truncation, points : RDD[MLVector], limits : SplitLimits) : Histogram = {
-    val counts = splitAndCountFrom(tree, trunc, points, limits)
+  def histogramFrom(tree : SpatialTree, trunc : Truncation, points : RDD[MLVector], limits : SplitLimits, stop : StopRule) : Histogram = {
+    val counts = splitAndCountFrom(tree, trunc, points, limits, stop)
     val totalCount = counts.values.sum
     Histogram(tree, totalCount, fromNodeLabelMap(counts))
   }
 
-  def histogram(points : RDD[MLVector], limits : SplitLimits) : Histogram =
+  def histogramStartingWith(h : Histogram, points : RDD[MLVector], limits : SplitLimits, stop : StopRule) : Histogram =
+    histogramFrom(h.tree, h.truncation, points, limits, stop)
+
+  def histogram(points : RDD[MLVector], limits : SplitLimits, stop : StopRule) : Histogram =
     histogramFrom(spatialTreeRootedAt(boundingBox(points)),
-                  rootTruncation, points, limits)
+                  rootTruncation, points, limits, stop)
 
   def main(args: Array[String]) = {
     Logger.getLogger("org").setLevel(Level.ERROR)
@@ -490,65 +579,107 @@ object ScalaDensity {
     val conf = new SparkConf().setAppName("ScalaDensity").setMaster("local[3]")//setMaster("spark://127.0.0.1:7077")
     val sc = new SparkContext(conf)
 
-    val dfnum = 200
-    val dfdim = 2
+    val dfnum = 2000
+    val dfdim = 3
     // val df = normalVectorRDD(sc, n, 2)
     val df = normalVectorRDD(sc, dfnum, dfdim, 3, 7387389)
 
-    def limits(totalVolume : Double, totalCount : Count)(depth : Int, volume : Volume, count : Count) =
-      count > dfnum/2 || (1 - count/totalCount)*volume/totalVolume > 0.1
+    def supportCarveLim(totalVolume : Double, totalCount : Count)(depth : Int, volume : Volume, count : Count) =
+      count > dfnum/2 || (1 - count/totalCount)*volume/totalVolume > 0.01
 
-    val h = histogram(df, limits)
+    def countLim(totalVolume : Double, totalCount : Count)(depth : Int, volume : Volume, count : Count) =
+      count > 10
 
-    // Print the root box
-    println("Root box")
-    val rootbox = h.tree.rootCell.factorise
-    rootbox.foreach {
-      case (l, u) => println(List("[",l,",",u,"]").mkString)
+    // factor out totalCount and totalVolume since they are the same for all nodes
+    def supportCarvePriority(lab : NodeLabel, c : Count, v : Volume) : Double = (1 - c)*v
+    def countPriority(lab : NodeLabel, c : Count, v : Volume) : Count = c
+
+    val supportCarvedH = histogram(df, supportCarveLim, noEarlyStop)
+
+    val temp = 0.005
+
+    var maxH = supportCarvedH
+    var maxLik = supportCarvedH.logPenalisedLik(temp)
+
+    supportCarvedH.backtrack(supportCarvePriority).foreach {
+      case h =>
+        val hLik = h.logPenalisedLik(1/temp)
+        if(hLik > maxLik) {
+          maxH = h
+          maxLik = hLik
+        }
     }
 
-    println("Total count")
-    println(h.totalCount)
+    val tributaryH = histogramStartingWith(maxH, df, countLim, noEarlyStop)
 
-    // Print depths
-    println("Depths")
-    val depths = h.counts.minimalCompletionNodes.map {
-      case (lab, _) => lab.depth
+    var minH = tributaryH
+    var minLoo = minH.looL2ErrorApprox
+    tributaryH.backtrack(countPriority).foreach {
+      case h =>
+        val hLoo = h.looL2ErrorApprox
+        if(hLoo < minLoo) {
+          minH = h
+          minLoo = hLoo
+        }
     }
-    depths.foreach(println(_))
 
-    // Print counts
-    println("Counts")
-    val counts = h.counts.minimalCompletionNodes.map {
-      case (_, None) => 0
-      case (_, Some(c)) => c
-    }
-    counts.foreach(println(_))
+    println("LOO scores:")
+    print("Support carved end: ")
+    println(supportCarvedH.looL2ErrorApprox)
+    print("Support carved maxLik: ")
+    println(maxH.looL2ErrorApprox)
+    print("Tributary end: ")
+    println(tributaryH.looL2ErrorApprox)
+    print("Tributary minLoo: ")
+    println(minH.looL2ErrorApprox)
 
-    // Print Volume
-    println("Volume")
-    val volumes = h.counts.minimalCompletionNodes.map {
-      case (lab, _) => h.tree.volumeAt(lab)
-    }
-    volumes.foreach(println(_))
+    // // Print the root box
+    // println("Root box")
+    // val rootbox = h.tree.rootCell.factorise
+    // rootbox.foreach {
+    //   case (l, u) => println(List("[",l,",",u,"]").mkString)
+    // }
 
-    // Print Probability
-    println("Probability")
-    val probabilities = h.counts.minimalCompletionNodes.map {
-      case (_, None)    => 0
-      case (_, Some(c)) => c.toDouble/h.totalCount
-    }
-    probabilities.foreach(println(_))
+    // println("Total count")
+    // println(h.totalCount)
 
-    // Print Density
-    println("Density")
-    val densities = h.counts.minimalCompletionNodes.map {
-      case (_, None)      => 0
-      case (lab, Some(c)) => c/(h.tree.volumeAt(lab) * h.totalCount)
-    }
-    densities.foreach(println(_))
+    // // Print depths
+    // println("Depths")
+    // val depths = h.counts.minimalCompletionNodes.map {
+    //   case (lab, _) => lab.depth
+    // }
+    // depths.foreach(println(_))
 
-    // println(fullTree)
+    // // Print counts
+    // println("Counts")
+    // val counts = h.counts.minimalCompletionNodes.map {
+    //   case (_, None) => 0
+    //   case (_, Some(c)) => c
+    // }
+    // counts.foreach(println(_))
+
+    // // Print Volume
+    // println("Volume")
+    // val volumes = h.counts.minimalCompletionNodes.map {
+    //   case (lab, _) => h.tree.volumeAt(lab)
+    // }
+    // volumes.foreach(println(_))
+
+    // // Print Probability
+    // println("Probability")
+    // val probabilities = h.counts.minimalCompletionNodes.map {
+    //   case (_, None)    => 0
+    //   case (_, Some(c)) => c.toDouble/h.totalCount
+    // }
+    // probabilities.foreach(println(_))
+
+    // // Print Density
+    // println("Density")
+    // val densities = h.counts.minimalCompletionNodes.map {
+    //   case (_, None)      => 0
+    //   case (lab, Some(c)) => c/(h.tree.volumeAt(lab) * h.totalCount)
+    // }
+    // densities.foreach(println(_))
 
     sc.stop()
   }

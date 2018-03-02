@@ -1,7 +1,5 @@
 import scala.language.postfixOps
 
-import org.scalatest.{ path => testPath, _ }
-
 import ScalaDensity._
 import org.apache.spark.mllib.linalg.{ Vector => MLVector, _ }
 import scala.math.{abs, pow}
@@ -10,6 +8,9 @@ import org.apache.spark.{ SparkContext, SparkConf }
 import org.apache.spark.rdd.RDD
 import org.apache.log4j.{ Logger, Level }
 import org.apache.spark.mllib.random.RandomRDDs.normalVectorRDD
+
+import org.scalatest.{ path => testPath, _ }
+import org.scalactic.TolerantNumerics
 
 class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   // "it" should "compile" in {
@@ -188,7 +189,7 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     def lims(tv : Volume, tc : Count)(d : Int, v : Volume, c : Count) : Boolean =
       c > 100 || (1 - c/tc)*v/tv > 0.1
 
-    val h = histogram(df, lims)
+    val h = histogram(df, lims, noEarlyStop)
 
     h.counts.minimalCompletionNodes.sliding(2).foreach {
       case ((llab, _) #:: (rlab, _) #:: _) =>
@@ -325,7 +326,7 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
       c > 100 || (1 - c/tc)*v/tv > 0.1
 
     val tree = spatialTreeRootedAt(bb)
-    val counts = splitAndCountFrom(tree, rootTruncation, df, lims)
+    val counts = splitAndCountFrom(tree, rootTruncation, df, lims, noEarlyStop)
 
     for((l, c) <- counts) {
       assert(!lims(tree.volumeAt(rootLabel), counts.values.sum)(l.depth, tree.volumeAt(l), c))
@@ -342,12 +343,123 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
       c > 100 || (1 - c/tc)*v/tv > 0.1
 
     val tree = spatialTreeRootedAt(bb)
-    val counts = splitAndCountFrom(tree, rootTruncation, df, lims)
+    val counts = splitAndCountFrom(tree, rootTruncation, df, lims, noEarlyStop)
 
     for((l, c) <- counts) {
       val b = tree.cellAt(l)
       assert(c === df.filter(b.contains(_)).count)
     }
+  }
+
+  "internal" should "finds all internal nodes" in {
+    val t = fromNodeLabelMap(List(rootLabel.left.left.right,
+                                  rootLabel.left.right.right,
+                                  rootLabel.right.right.left).map((_, ())).toMap)
+    val internals1 = (BigInt(1) to t.truncation.leaves.map(_.lab).max).
+      map(NodeLabel(_)).
+      filter(x => t.truncation.leaves.exists(isAncestorOf(x, _))).
+      toSet
+    val internals2 = t.
+      internal((), (_ : Unit, _ : Unit) => ()).
+      map(_._1).
+      toSet
+    assert(internals1 === internals2)
+  }
+
+  it should "accumulate correct values" in {
+    val t = fromNodeLabelMap(List(rootLabel.left.left.right,
+                                  rootLabel.left.right.right,
+                                  rootLabel.right.right.left).map(x => (x, Set(x))).toMap)
+
+    val internals1 = (BigInt(1) to t.truncation.leaves.map(_.lab).max).
+      map(NodeLabel(_)).
+      filter(x => t.truncation.leaves.exists(isAncestorOf(x, _))).
+      map(lab => (lab, t.slice(t.truncation.subtree(lab)).reduce(_.union(_)))).
+      toSet
+
+    val internals2 = t.
+      internal(Set.empty, _.union(_)).
+      toSet
+
+    assert(internals1 === internals2)
+  }
+
+  "backtrack" should "have things in priority order" in {
+    def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    def lims(tv : Volume, tc : Count)(d : Int, v : Volume, c : Count) : Boolean =
+      c > 100 || (1 - c/tc)*v/tv > 0.1
+    val h = histogram(df, lims, noEarlyStop)
+
+    // def go(xs : Stream[(NodeLabel, Count)]) : Boolean = cs match {
+    //   case Stream.Empty => true
+    //   case ((lab, c) #:: xss) => (vs.forall { case (lab2, c2) => isAncestorOf(lab2, lab) }) && go(xss)
+    // }
+    // val nrinternals = (BigInt(1) to h.counts.truncation.leaves.map(_.lab).max).
+    //   map(NodeLabel(_)).
+    //   filter(x => h.counts.truncation.leaves.exists(isAncestorOf(x, _))).
+    //   size
+
+    val bt = h.backtrackNodes(prio)
+
+    bt.tails.foreach {
+      case Stream.Empty => ()
+      case ((lab1, c1) #:: rest) =>
+        rest.foreach {
+          case (lab2, c2) => assert(isAncestorOf(lab2, lab1) || c1 <= c2)
+        }
+        rest.exists {
+          case (lab2, _) => lab2 === lab1.parent
+        }
+    }
+  }
+
+  it should "give histograms of decreasing size" in {
+    def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    def lims(tv : Volume, tc : Count)(d : Int, v : Volume, c : Count) : Boolean =
+      c > 100 || (1 - c/tc)*v/tv > 0.1
+    val h = histogram(df, lims, noEarlyStop)
+
+    // def go(xs : Stream[(NodeLabel, Count)]) : Boolean = cs match {
+    //   case Stream.Empty => true
+    //   case ((lab, c) #:: xss) => (vs.forall { case (lab2, c2) => isAncestorOf(lab2, lab) }) && go(xss)
+    // }
+    // h.backtrack(prio).foreach {
+    //   case x =>
+    //     print("Backtrack Result: ")
+    //     println(x.truncation.leaves.toList)
+    // }
+    h.backtrack(prio).sliding(2).foreach {
+      case (h1 #:: h2 #:: rest) =>
+        // print(h1.truncation.leaves.toList)
+        // print("--")
+        // println(h2.truncation.leaves.toList)
+        val diff1 = h1.truncation.leaves.toSet -- h2.truncation.leaves.toSet
+        val diff2 = h2.truncation.leaves.toSet -- h1.truncation.leaves.toSet
+        // println(diff1)
+        // println(diff2)
+        assert(0 < diff1.size && diff1.size <= 2)
+        assert(diff2.size == 1)
+        assert(diff2.forall(x => diff1.exists(y => isAncestorOf(x, y))))
+    }
+  }
+
+  "mergeSubtree" should "contain the correct leaves" in {
+    val t = fromNodeLabelMap(Map(rootLabel.left.left.left    -> 1,
+                                 rootLabel.left.left.right   -> 2,
+                                 rootLabel.left.right.left   -> 3,
+                                 rootLabel.left.right.right  -> 4,
+                                 rootLabel.right.left.left   -> 5,
+                                 rootLabel.right.left.right  -> 6,
+                                 rootLabel.right.right.left  -> 7,
+                                 rootLabel.right.right.right -> 8 ))
+    val l = rootLabel.left
+    val m = t.mergeSubtree(l, _ + _)
+
+    val n = m.leaves.toSet -- t.leaves.toSet
+    val d = t.leaves.toSet -- m.leaves.toSet
+
+    assert(n == Set(l))
+    d.foreach(x => assert(isAncestorOf(l, x)))
   }
 
   // "descend" should "be a decreasing sequence termining in empty" in {

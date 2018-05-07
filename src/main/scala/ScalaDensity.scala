@@ -43,7 +43,7 @@ object ScalaDensity {
   type Intercept = Double
   type Volume = Double
 
-  case class Rectangle(low : Array[Double], high : Array[Double]) {
+  case class Rectangle(low : Vector[Double], high : Vector[Double]) {
     def factorise() : Iterator[(Double, Double)] = low.toIterator.zip(high.toIterator)
     override def toString = factorise().mkString("x")
 
@@ -72,7 +72,7 @@ object ScalaDensity {
       ((high, low).zipped map (_-_)) reduce (_*_)
 
     def contains(v : MLVector) =
-      (high, low, v.toArray).zipped.forall { case (h, l, c) => h >= c && c >= l }
+      v.toArray.toVector.zip(high.zip(low)).forall { case (c, (h, l)) => h >= c && c >= l }
 
     def isLeftOfCentre(along : Axis, v : MLVector) : Boolean =
       v(along) <= centre(along)
@@ -86,7 +86,7 @@ object ScalaDensity {
                (b1.high, b2.high).zipped map max )
 
   def point(v : MLVector) : Rectangle =
-    Rectangle(v.toArray, v.toArray)
+    Rectangle(v.toArray.toVector, v.toArray.toVector)
 
   def boundingBox(vs : RDD[MLVector]) : Rectangle =
     vs.map(point(_)).reduce(hull)
@@ -234,26 +234,61 @@ object ScalaDensity {
   case class Subset(lower : Int, upper : Int) {
     def size() : Int = upper - lower
     def isEmpty() : Boolean = size() == 0
+    def midpoint() : Int = (upper + lower)/2 // Should round down
+    def sliceLow(x : Int) : Subset = Subset(max(x, lower), max(x, upper))
+    def sliceHigh(x : Int) : Subset = Subset(min(x, lower), min(x, upper))
+    def normalise() : Subset = if(size() == 0) Subset(0,0) else this
+  }
+
+  // WARNING: expects f(x_1), f(x_2), ... to initially be all false then all true
+  def binarySearchWithin[A](f : A => Boolean)(xs : Vector[A], ss : Subset) : Int = {
+    val res = Stream.iterate(ss) {
+      case s =>
+        if(f(xs(s.midpoint)))
+          s.sliceHigh(s.midpoint)
+        else
+          s.sliceLow(s.midpoint)
+    }.dropWhile(_.size > 1)
+
+    // TODO: Make this nicer
+    if(res.head.size == 0)
+      ss.upper
+    else
+      res.tail.head.upper
+  }
+
+  def binarySearch[A](f : A => Boolean)(xs : Vector[A]) : Int = {
+    binarySearchWithin(f)(xs, Subset(0, xs.size))
   }
 
   type Walk = Stream[NodeLabel]
 
-  case class Truncation(leaves : Array[NodeLabel]) {
+  case class Truncation(leaves : Vector[NodeLabel]) {
     // TODO: Make this a more efficent binary search
     def subtreeWithin(at : NodeLabel, within : Subset) : Subset = {
-      val mid = (within.lower until within.upper)
-        .dropWhile(i => isLeftOf(leaves(i), at))
-        .takeWhile(i => at == leaves(i) || isDescendantOf(leaves(i), at))
+      // val mid = (within.lower until within.upper)
+      //   .dropWhile(i => isLeftOf(leaves(i), at))
+      //   .takeWhile(i => at == leaves(i) || isDescendantOf(leaves(i), at))
 
-      if(mid.length > 0)
-        Subset(mid.head, mid.last+1)
-      else
-        Subset(0, 0)
+      // if(mid.length > 0)
+      //   Subset(mid.head, mid.last+1)
+      // else
+      //   Subset(0, 0)
+
+      // if(within.isEmpty || isRightOf(at, leaves(within.upper-1)) || isLeftOf(at, leaves(within.lower))) {
+      //      Subset(0, 0)
+      // } else {
+      val low = binarySearchWithin((x : NodeLabel) => !isLeftOf(x, at))(leaves, within)
+      val high = binarySearchWithin((x : NodeLabel) => x != at && !isDescendantOf(x, at))(leaves, within.sliceLow(low))
+      Subset(low, high).normalise
+      // }
     }
 
     def allNodes() : Subset = Subset(0, leaves.length)
 
     def subtree(at : NodeLabel) : Subset = subtreeWithin(at, allNodes())
+
+    def slice(ss : Subset) : Iterator[NodeLabel] = leaves.slice(ss.lower, ss.upper).toIterator
 
     def descend(labs : Walk) : Stream[Subset] =
       labs.scanLeft(allNodes()) {
@@ -296,24 +331,24 @@ object ScalaDensity {
     }
 
     def minimalCompletion() : Truncation =
-      Truncation(minimalCompletionNodes.map(_._1).toArray)
+      Truncation(minimalCompletionNodes.map(_._1).toVector)
   }
 
   // WARNING: Currently does not check whether leaves can be a set of leaves
   // (i.e. that it does not contain ancestor-descendant pairs)
   def fromLeafSet(leaves : Iterable[NodeLabel]) : Truncation =
-    Truncation(leaves.toArray.sorted(leftRightOrd))
+    Truncation(leaves.toVector.sorted(leftRightOrd))
 
-  def rootTruncation() : Truncation = Truncation(Array(rootLabel))
+  def rootTruncation() : Truncation = Truncation(Vector(rootLabel))
 
   def some[A](a : A) : Option[A] = Some(a)
   def none[A]() : Option[A] = None
 
   // TODO: Figure out something more efficient
-  // def cutArray[A:ClassTag](xs : Array[A], from : Int, to : Int) : Array[A] =
-  //   (xs.slice(0, from) ++ xs.slice(to, xs.length)).toArray
+  // def cutVector[A:ClassTag](xs : Vector[A], from : Int, to : Int) : Vector[A] =
+  //   (xs.slice(0, from) ++ xs.slice(to, xs.length)).toVector
 
-  case class LeafMap[A:ClassTag](truncation : Truncation, vals : Array[A]) {
+  case class LeafMap[A:ClassTag](truncation : Truncation, vals : Vector[A]) {
     // TODO: Optimise?
     def query(labs : Walk) : (NodeLabel, Option[A]) = {
       val (at, ss) = truncation.descendUntilLeafWhere(labs)
@@ -330,18 +365,25 @@ object ScalaDensity {
       val ss = truncation.subtree(at)
       if(ss.size == 0) this
       else {
-        // println(ss.size)
-        val newLeaves = truncation.leaves.slice(0, ss.lower) ++ Seq(at) ++ truncation.leaves.slice(ss.upper, truncation.leaves.length)
-        // println(truncation.leaves.toList)
-        // println(newLeaves.toList)
-        val newVals = vals.slice(0, ss.lower) ++ Seq(slice(ss).reduce(op)) ++ vals.slice(ss.upper, vals.length)
-        // println(vals.toList)
-        // println(newVals.toList)
-        LeafMap(Truncation(newLeaves.toArray), newVals.toArray)
+        val oldLeaves : Vector[NodeLabel] = truncation.leaves
+        var newLeaves : Array[NodeLabel] = Array.fill(oldLeaves.size - ss.size + 1)(rootLabel)
+        oldLeaves.slice(0, ss.lower).copyToArray(newLeaves)
+        oldLeaves.slice(ss.upper, oldLeaves.length).copyToArray(newLeaves, ss.lower+1)
+        newLeaves(ss.lower) = at
+
+        val oldVals : Vector[A] = vals
+        var newVals : Array[A] = Array.fill(oldVals.size - ss.size + 1)(vals(0))
+        oldVals.slice(0, ss.lower).copyToArray(newVals)
+        oldVals.slice(ss.upper, oldVals.length).copyToArray(newVals, ss.lower+1)
+        newVals(ss.lower) = slice(ss).reduce(op)
+        // val newLeaves = truncation.leaves.slice(0, ss.lower).toSeq ++ Seq(at) ++ truncation.leaves.slice(ss.upper, truncation.leaves.length).toSeq
+        // val newVals = vals.slice(0, ss.lower).toSeq ++ Seq(slice(ss).reduce(op)) ++ vals.slice(ss.upper, vals.length).toSeq
+        // LeafMap(Truncation(newLeaves.toVector), newVals.toVector)
+        LeafMap(Truncation(newLeaves.toVector), newVals.toVector)
       }
     }
 
-    def leaves() : Array[NodeLabel] = truncation.leaves
+    def leaves() : Vector[NodeLabel] = truncation.leaves
 
     def toMap() : Map[NodeLabel, A] =
       toIterable().toMap
@@ -374,7 +416,7 @@ object ScalaDensity {
   }
 
   def fromNodeLabelMap[A:ClassTag](xs : Map[NodeLabel, A]) : LeafMap[A] = {
-    val (labs, vals) = xs.toArray.sortWith({case(x,y) => isLeftOf(x._1, y._1)}).unzip
+    val (labs, vals) = xs.toVector.sortWith({case(x,y) => isLeftOf(x._1, y._1)}).unzip
     LeafMap(Truncation(labs), vals)
   }
 
@@ -447,6 +489,8 @@ object ScalaDensity {
       case (lab : NodeLabel, c : Count) => (tree.volumeAt(lab), c)
     }
 
+    def ncells() : Int = counts.size
+
     def looL2ErrorApprox() : Double = looL2ErrorApproxFromCells(totalCount, cells())
 
     def logLik() : Double = counts.toIterable.map {
@@ -464,25 +508,58 @@ object ScalaDensity {
         def compare(x : (H, NodeLabel, Count), y : (H, NodeLabel, Count)) = {
           val (xH, xLab, _) = x
           val (yH, yLab, _) = y
-          if(isAncestorOf(xLab, yLab)) 1
-          else if(isAncestorOf(yLab, xLab)) -1
-          else ord.compare(xH, yH)
+          if(isDescendantOf(xLab, yLab)) { -1 }
+          else if(isDescendantOf(yLab, xLab)) { 1 }
+          else { ord.compare(xH, yH) }
         }
       }
 
-      var q = new PriorityQueue()(BacktrackOrder.reverse)
-      for((lab, cacc) <- counts.internal(0, _+_)) {
-        q += ((prio(lab, cacc, tree.volumeAt(lab)), lab, cacc))
-      }
+      // TODO: WHY DOES THE PRIORITY QUEUE GIVE UNSORTED RESULTS!?!?!?!?!?
 
-      q.dequeueAll.toStream.map({case (_, lab, c) => (lab, c)})
+      // var q = new PriorityQueue[(H, NodeLabel, Count)]()(BacktrackOrder.reverse)
+      // for((lab, cacc) <- counts.internal(0, _+_)) {
+      //   q += (prio(lab, cacc, tree.volumeAt(lab)), lab, cacc)
+      // }
+
+      // val scalaaargh = counts.internal(0, _+_).map {
+      //   case (lab, cacc) => (prio(lab, cacc, tree.volumeAt(lab)), lab, cacc)
+      // }
+      // val q = PriorityQueue[(H, NodeLabel, Count)](scalaaargh: _*)(BacktrackOrder)
+      // // q ++= scalaaargh
+
+      // q.dequeueAll.toStream.map({case (_, lab, c) => (lab, c)})
+
+      // SSCCCAAAALLLLAAAAAA!!!!!
+      counts.internal(0, _+_).sortBy({
+        case (lab, cacc) => (prio(lab, cacc, tree.volumeAt(lab)), lab, cacc)
+      })(BacktrackOrder).toStream
     }
 
     def backtrack[H](prio : PriorityFunction[H])(implicit ord : Ordering[H]) : Stream[Histogram] = {
       backtrackNodes(prio).scanLeft(this) {
         // NOTE: This results in two extra lookups, but is nicer API-wise
         case (h : Histogram, (lab, _)) =>
-            Histogram(tree, totalCount, h.counts.mergeSubtree(lab, _+_))
+          // println(lab)
+          val newCounts = h.counts.mergeSubtree(lab, _+_)
+          // assert(!counts.truncation.leaves.contains(lab))
+          assert(counts.truncation.subtree(lab).size > 0)
+          // assert(counts.truncation.leaves(counts.truncation.subtree(lab).lower) != lab)
+          if(!newCounts.truncation.leaves.contains(lab)) {
+            // TODO: Debug
+            // print("Lv1: ")
+            // println(counts.truncation.leaves.toList)
+            // print("Lv2: ")
+            // println(newCounts.truncation.leaves.toList)
+            // print("Lab: ")
+            // println(lab)
+            // println("...")
+            // print("SS1: ")
+            // println(counts.truncation.slice(counts.truncation.subtree(lab)).toList)
+            // print("SS2: ")
+            // println(newCounts.truncation.slice(counts.truncation.subtree(lab)).toList)
+            // assert(newCounts.truncation.leaves.contains(lab))
+          }
+          Histogram(tree, totalCount, newCounts)
       }.tail
     }
   }
@@ -573,7 +650,7 @@ object ScalaDensity {
     histogramFrom(spatialTreeRootedAt(boundingBox(points)),
                   rootTruncation, points, limits, stop)
 
-  def main(args: Array[String]) = {
+  def main(args: Vector[String]) = {
     Logger.getLogger("org").setLevel(Level.ERROR)
     Logger.getLogger("akka").setLevel(Level.ERROR)
     val conf = new SparkConf().setAppName("ScalaDensity").setMaster("local[3]")//setMaster("spark://127.0.0.1:7077")
@@ -682,5 +759,18 @@ object ScalaDensity {
     // densities.foreach(println(_))
 
     sc.stop()
+  }
+
+  def testRun() : Histogram = {
+    val dfnum = 100000
+    val dfdim = 3
+    Logger.getLogger("org").setLevel(Level.ERROR)
+    Logger.getLogger("akka").setLevel(Level.ERROR)
+    val conf = new SparkConf().setAppName("ScalaDensityTest").setMaster("local")
+    val sc = new SparkContext(conf)
+    val df = normalVectorRDD(sc, dfnum, dfdim, 6, 7387389).cache()
+    def lims(totalVolume : Double, totalCount : Count)(depth : Int, volume : Volume, count : Count) =
+      count > dfnum/2 || (1 - count/totalCount)*volume > 0.001*totalVolume
+    histogram(df, lims, noEarlyStop)
   }
 }

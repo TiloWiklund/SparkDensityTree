@@ -15,6 +15,7 @@
 **************************************************************************/
 import scala.math.{min, max, exp, log, pow, ceil}
 import scala.math.BigInt._
+import scala.math.PartialOrdering
 
 import scala.collection.mutable.{ HashMap, PriorityQueue }
 import scala.collection.mutable.{ Set => MSet, Map => MMap }
@@ -74,10 +75,10 @@ object ScalaDensity {
     def contains(v : MLVector) =
       v.toArray.toVector.zip(high.zip(low)).forall { case (c, (h, l)) => h >= c && c >= l }
 
-    def isLeftOfCentre(along : Axis, v : MLVector) : Boolean =
+    def isStrictLeftOfCentre(along : Axis, v : MLVector) : Boolean =
       v(along) <= centre(along)
 
-    def isRightOfCentre(along : Axis, v : MLVector) : Boolean =
+    def isStrictRightOfCentre(along : Axis, v : MLVector) : Boolean =
       v(along) >  centre(along)
   }
 
@@ -139,12 +140,48 @@ object ScalaDensity {
 
   val rootLabel : NodeLabel = NodeLabel(1)
 
+  def join(a : NodeLabel, b : NodeLabel) : NodeLabel = {
+    val d = min(a.depth, b.depth)
+    val aT = a.truncate(d)
+    val bT = b.truncate(d)
+    aT.ancestor((aT.lab ^ bT.lab).bitLength)
+  }
+
   object leftRightOrd extends Ordering[NodeLabel] {
-    def compare(a : NodeLabel, b : NodeLabel) = a.truncate(b.depth).lab compare b.truncate(a.depth).lab
+    def compare(a : NodeLabel, b : NodeLabel) = {
+      if(a == b) 0
+      else {
+        val j = join(a, b)
+        if(inLeftSubtreeOf(a, j) || inRightSubtreeOf(b, j)) -1
+        else 1
+      }
+    }
+  }
+
+  object ancestralOrder extends PartialOrdering[NodeLabel] {
+    def tryCompare(a : NodeLabel, b : NodeLabel) = {
+      if(a == b) some(0)
+      else if(a.lab < b.lab) {
+        if(b.truncate(a.depth) == a) some(-1)
+        else                         none()
+      }
+      else /* if(a.lab > b.lab) */ {
+        if(a.truncate(b.depth) == b) some( 1)
+        else                         none()
+      }
+    }
+
+    def lteq(a : NodeLabel, b : NodeLabel) = {
+      this.tryCompare(a, b) match {
+        case Some(c) => c <= 0
+        case None    => false
+      }
+    }
   }
 
   def isAncestorOf(a : NodeLabel, b : NodeLabel) : Boolean =
-    a.lab < b.lab && leftRightOrd.compare(a, b) == 0
+    a.lab < b.lab && b.truncate(a.depth) == a
+    // a.lab < b.lab && leftRightOrd.compare(a, b) == 0
 
   def isDescendantOf(a : NodeLabel, b : NodeLabel) : Boolean =
     isAncestorOf(b, a)
@@ -152,8 +189,15 @@ object ScalaDensity {
   def isLeftOf(a : NodeLabel, b : NodeLabel) : Boolean =
     leftRightOrd.compare(a, b) < 0
 
+  def isStrictLeftOf(a : NodeLabel, b : NodeLabel) : Boolean =
+    a.truncate(b.depth).lab < b.truncate(a.depth).lab
+    // leftRightOrd.compare(a, b) < 0
+
   def isRightOf(a : NodeLabel, b : NodeLabel) : Boolean =
-    isLeftOf(b, a)
+    leftRightOrd.compare(a, b) > 0
+
+  def isStrictRightOf(a : NodeLabel, b : NodeLabel) : Boolean =
+    isStrictLeftOf(b, a)
 
   def inLeftSubtreeOf(a : NodeLabel, b : NodeLabel) : Boolean =
     a == b.left || isAncestorOf(b.left, a)
@@ -163,13 +207,6 @@ object ScalaDensity {
 
   def adjacent(a : NodeLabel, b : NodeLabel) : Boolean =
     a.parent == b || b.parent == a
-
-  def join(a : NodeLabel, b : NodeLabel) : NodeLabel = {
-    val d = min(a.depth, b.depth)
-    val aT = a.truncate(d)
-    val bT = b.truncate(d)
-    aT.ancestor((aT.lab ^ bT.lab).bitLength)
-  }
 
   def path(from : NodeLabel, to : NodeLabel) : Stream[NodeLabel] = {
     if(from == to) {
@@ -201,6 +238,8 @@ object ScalaDensity {
     def apply(lab : NodeLabel) : A = {
       val inCache : NodeLabel = (lab.ancestors.dropWhile(!cache.isDefinedAt(_)) #::: Stream(rootLabel)).head
       val startWith : A = if(inCache == rootLabel) base else cache(inCache)
+
+      // println(lab)
 
       // TODO: Make this nicer
       var clab = inCache
@@ -261,13 +300,39 @@ object ScalaDensity {
     binarySearchWithin(f)(xs, Subset(0, xs.size))
   }
 
+  class PadIterator[A](iter : Iterator[A], atInit : Int, atEnd : Int) extends Iterator[A]  {
+    // WARNING: Just crashes if iter is empty (but also has undefined semantics in that case!)
+    var last = iter.next()
+    var initCount = atInit+1
+    var endCount = atEnd
+    override def hasNext() : Boolean =
+      iter.hasNext || endCount > 0
+    override def next() : A = {
+      // println(initCount)
+      // println(endCount)
+      if(initCount > 0) {
+        initCount = initCount - 1
+        last
+      } else if(iter.hasNext) {
+        last = iter.next()
+        last
+      } else {
+        endCount = endCount - 1
+        last
+      }
+    }
+  }
+
+  def padIterator[A](iter : Iterator[A], atInit : Int, atEnd : Int) : Iterator[A] =
+    new PadIterator(iter, atInit, atEnd)
+
   type Walk = Stream[NodeLabel]
 
   case class Truncation(leaves : Vector[NodeLabel]) {
     // TODO: Make this a more efficent binary search
     def subtreeWithin(at : NodeLabel, within : Subset) : Subset = {
       // val mid = (within.lower until within.upper)
-      //   .dropWhile(i => isLeftOf(leaves(i), at))
+      //   .dropWhile(i => isStrictLeftOf(leaves(i), at))
       //   .takeWhile(i => at == leaves(i) || isDescendantOf(leaves(i), at))
 
       // if(mid.length > 0)
@@ -275,10 +340,10 @@ object ScalaDensity {
       // else
       //   Subset(0, 0)
 
-      // if(within.isEmpty || isRightOf(at, leaves(within.upper-1)) || isLeftOf(at, leaves(within.lower))) {
+      // if(within.isEmpty || isStrictRightOf(at, leaves(within.upper-1)) || isStrictLeftOf(at, leaves(within.lower))) {
       //      Subset(0, 0)
       // } else {
-      val low = binarySearchWithin((x : NodeLabel) => !isLeftOf(x, at))(leaves, within)
+      val low = binarySearchWithin((x : NodeLabel) => !isStrictLeftOf(x, at))(leaves, within)
       val high = binarySearchWithin((x : NodeLabel) => x != at && !isDescendantOf(x, at))(leaves, within.sliceLow(low))
       Subset(low, high).normalise
       // }
@@ -287,6 +352,66 @@ object ScalaDensity {
     def allNodes() : Subset = Subset(0, leaves.length)
 
     def subtree(at : NodeLabel) : Subset = subtreeWithin(at, allNodes())
+
+    def viewSubtree(at : NodeLabel, margin : Int) : Vector[NodeLabel] = {
+      val ss = subtree(at)
+      leaves.slice(ss.lower-margin, ss.upper+margin)
+    }
+
+    def cherryAtIdx(idx : Int) : Option[Vector[Int]] = {
+      val x = leaves(idx)
+      if(x.isLeft) {
+        if(idx == leaves.length-1) {
+          some(Vector(idx))
+        } else {
+          val r = leaves(idx+1)
+          if(r == x.sibling) some(Vector(idx, idx+1))
+          else if(!inRightSubtreeOf(r, x.parent)) some(Vector(idx))
+          else none()
+        }
+      } else {
+        if(idx == 0) {
+          some(Vector(idx))
+        } else {
+          val l = leaves(idx-1)
+          if(l == x.sibling) some(Vector(idx-1, idx))
+          else if(!inLeftSubtreeOf(l, x.parent)) some(Vector(idx))
+          else none()
+        }
+      }
+    }
+
+    def hasAsCherry(lab : NodeLabel) : Boolean = {
+      val ss = subtree(lab)
+      ss.size match {
+        case 1 => leaves(ss.lower) == lab.left || leaves(ss.lower)   == lab.right
+        case 2 => leaves(ss.lower) == lab.left && leaves(ss.lower+1) == lab.right
+        case n => false
+      }
+    }
+
+    def cherries() : Iterator[Vector[Int]] = {
+      val inner = (0 until leaves.length).sliding(2).flatMap {
+        case x =>
+          val l = leaves(x(0))
+          val r = leaves(x(1))
+          if(l.sibling == r) { List(Vector(x(0), x(1))) }
+          else {
+            val lonerl =
+              if(l.isLeft && !inRightSubtreeOf(r, l.parent)) List(Vector(x(0)))
+              else                                           List()
+            val lonerr =
+              if(r.isRight && !inLeftSubtreeOf(l, r.parent)) List(Vector(x(1)))
+              else                                           List()
+            lonerl ++ lonerr
+          }
+      }.toIterator
+
+      val leftcorner  = (if(leaves.head.isRight) List(Vector(0)) else List()).toIterator
+      val rightcorner = (if(leaves.last.isLeft) List(Vector(leaves.length-1)) else List()).toIterator
+
+      leftcorner ++ inner ++ rightcorner
+    }
 
     def slice(ss : Subset) : Iterator[NodeLabel] = leaves.slice(ss.lower, ss.upper).toIterator
 
@@ -344,6 +469,7 @@ object ScalaDensity {
   def some[A](a : A) : Option[A] = Some(a)
   def none[A]() : Option[A] = None
 
+
   // TODO: Figure out something more efficient
   // def cutVector[A:ClassTag](xs : Vector[A], from : Int, to : Int) : Vector[A] =
   //   (xs.slice(0, from) ++ xs.slice(to, xs.length)).toVector
@@ -361,15 +487,17 @@ object ScalaDensity {
 
     def slice(ss : Subset) : Iterator[A] = vals.slice(ss.lower, ss.upper).toIterator
 
-    def mergeSubtree(at : NodeLabel, op : (A, A) => A) : LeafMap[A] = {
+    def mergeSubtreeWithIdx(at : NodeLabel, op : (A, A) => A) : (Option[Int], LeafMap[A]) = {
       val ss = truncation.subtree(at)
-      if(ss.size == 0) this
+      if(ss.size == 0) (none(), this)
       else {
         val oldLeaves : Vector[NodeLabel] = truncation.leaves
         var newLeaves : Array[NodeLabel] = Array.fill(oldLeaves.size - ss.size + 1)(rootLabel)
         oldLeaves.slice(0, ss.lower).copyToArray(newLeaves)
         oldLeaves.slice(ss.upper, oldLeaves.length).copyToArray(newLeaves, ss.lower+1)
         newLeaves(ss.lower) = at
+
+        val newTruncation = Truncation(newLeaves.toVector)
 
         val oldVals : Vector[A] = vals
         var newVals : Array[A] = Array.fill(oldVals.size - ss.size + 1)(vals(0))
@@ -379,9 +507,34 @@ object ScalaDensity {
         // val newLeaves = truncation.leaves.slice(0, ss.lower).toSeq ++ Seq(at) ++ truncation.leaves.slice(ss.upper, truncation.leaves.length).toSeq
         // val newVals = vals.slice(0, ss.lower).toSeq ++ Seq(slice(ss).reduce(op)) ++ vals.slice(ss.upper, vals.length).toSeq
         // LeafMap(Truncation(newLeaves.toVector), newVals.toVector)
-        LeafMap(Truncation(newLeaves.toVector), newVals.toVector)
+
+        (some(ss.lower), LeafMap(newTruncation, newVals.toVector))
       }
     }
+
+    def mergeSubtreeCheckCherry(at : NodeLabel, op : (A, A) => A) : (Option[(NodeLabel, A)], LeafMap[A]) = {
+      val (idxOpt, t) = mergeSubtreeWithIdx(at, op)
+      idxOpt match {
+        case None => (None, t)
+        case Some(idx) =>
+          t.truncation.cherryAtIdx(idx) match {
+            case None => (None, t)
+            case Some(vs) => {
+              val lab = t.truncation.leaves(vs(0))
+              if(lab == rootLabel)
+                (none(), t)
+              else
+                (some((lab.parent, vs.map(t.vals(_)).reduce(op))), t)
+            }
+          }
+      }
+    }
+
+    def cherries(op : (A, A) => A) : Iterator[(NodeLabel, A)] =
+      truncation.cherries().map(x => (truncation.leaves(x(0)).parent, x.map(vals(_)).reduce(op)))
+
+    def mergeSubtree(at : NodeLabel, op : (A, A) => A) : LeafMap[A] =
+      mergeSubtreeWithIdx(at, op)._2
 
     def leaves() : Vector[NodeLabel] = truncation.leaves
 
@@ -416,7 +569,7 @@ object ScalaDensity {
   }
 
   def fromNodeLabelMap[A:ClassTag](xs : Map[NodeLabel, A]) : LeafMap[A] = {
-    val (labs, vals) = xs.toVector.sortWith({case(x,y) => isLeftOf(x._1, y._1)}).unzip
+    val (labs, vals) = xs.toVector.sortWith({case(x,y) => isStrictLeftOf(x._1, y._1)}).unzip
     LeafMap(Truncation(labs), vals)
   }
 
@@ -446,7 +599,7 @@ object ScalaDensity {
       def step(lab : NodeLabel, box : Rectangle) : (NodeLabel, Rectangle) = {
         val along = axisAt(lab)
 
-        if(box.isLeftOfCentre(along, point))
+        if(box.isStrictLeftOfCentre(along, point))
           (lab.left, box.lower(along))
         else
           (lab.right, box.upper(along))
@@ -474,6 +627,20 @@ object ScalaDensity {
 
   type PriorityFunction[H] = (NodeLabel, Count, Volume) => H
 
+  // class PriorityIterator[S,A](init : S, inits : Seq[A])(pull : A => Option[A])(implicit ord : Ordering[A]) extends Iterator[A] {
+  //   val pq = PriorityQueue(init: _*)(ord)
+  //   val s = 
+  //   override def hasNext : Boolean = !pq.isEmpty
+  //   override def next() : A = {
+  //     val a = pq.enqueue()
+  //     pull(a) match {
+  //       None => ()
+  //       Some(anew) => pq += a
+  //     }
+  //     a
+  //   }
+  // }
+
   case class Histogram(tree : SpatialTree, totalCount : Count, counts : LeafMap[Count]) {
     def density(v : MLVector) : Double = {
       counts.query(tree.descendBox(v)) match {
@@ -500,68 +667,114 @@ object ScalaDensity {
     def logPenalisedLik(taurec : Double) : Double =
       log(exp(taurec) - 1) - counts.toIterable.size*taurec + logLik()
 
-    def backtrackNodes[H](prio : PriorityFunction[H])(implicit ord : Ordering[H])
-        : Stream[(NodeLabel, Count)] = {
+    def backtrackWithNodes[H](prio : PriorityFunction[H])(implicit ord : Ordering[H]) : Iterator[(NodeLabel, Histogram)] = {
+      val start = counts.cherries(_+_).map {
+        case (lab, c) => (prio(lab, c, tree.volumeAt(lab)), lab)
+      }.toSeq
 
-      // TODO: Rewrite this in terms of PartialOrder[NodeLabel] and lexicographic order
-      object BacktrackOrder extends Ordering[(H, NodeLabel, Count)] {
-        def compare(x : (H, NodeLabel, Count), y : (H, NodeLabel, Count)) = {
-          val (xH, xLab, _) = x
-          val (yH, yLab, _) = y
-          if(isDescendantOf(xLab, yLab)) { -1 }
-          else if(isDescendantOf(yLab, xLab)) { 1 }
-          else { ord.compare(xH, yH) }
+      val thisOuter : Histogram = this
+
+      class HistogramIterator extends Iterator[(NodeLabel, Histogram)] {
+        val q = PriorityQueue(start: _*)(ord.reverse.on(_._1))
+        var h = thisOuter
+        override def hasNext : Boolean = !q.isEmpty
+        override def next() : (NodeLabel, Histogram) = {
+          val (_, lab : NodeLabel) = q.dequeue()
+
+          // println(h.counts.vals.size)
+          // if(!h.counts.truncation.hasAsCherry(lab)) {
+          //   println("GOT NON-CHERRY!")
+          //   println(lab)
+          //   println(h.counts.truncation.viewSubtree(lab,1))
+          // } else {
+          //   print("OK: ")
+          //   println(lab)
+          // }
+
+          val (cOpt, countsNew) = h.counts.mergeSubtreeCheckCherry(lab, _+_)
+
+          val hnew = Histogram(h.tree, h.totalCount, countsNew)
+
+          cOpt match {
+            case None => ()
+            case Some((cLab, cCnt)) => {
+              q += ((prio(cLab, cCnt, tree.volumeAt(cLab)), cLab))
+              // print("Adding: ")
+              // println(cLab)
+            }
+          }
+
+          h = hnew
+
+          (lab, hnew)
         }
       }
 
-      // TODO: WHY DOES THE PRIORITY QUEUE GIVE UNSORTED RESULTS!?!?!?!?!?
+      new HistogramIterator()
 
-      // var q = new PriorityQueue[(H, NodeLabel, Count)]()(BacktrackOrder.reverse)
-      // for((lab, cacc) <- counts.internal(0, _+_)) {
-      //   q += (prio(lab, cacc, tree.volumeAt(lab)), lab, cacc)
-      // }
+      // val q = PriorityQueue[(H, NodeLabel)](start: _*)(ord.reverse.on(_._1))
+      // println(q)
+      // Stream.iterate((rootLabel, this)) {
+      //   case (_, h : Histogram) =>
+      //     //Ugly HACK part 1!
+      //     if(q.isEmpty) (NodeLabel(0), h)
+      //     else {
+      //       val (_, lab) = q.dequeue()
 
-      // val scalaaargh = counts.internal(0, _+_).map {
-      //   case (lab, cacc) => (prio(lab, cacc, tree.volumeAt(lab)), lab, cacc)
-      // }
-      // val q = PriorityQueue[(H, NodeLabel, Count)](scalaaargh: _*)(BacktrackOrder)
-      // // q ++= scalaaargh
+      //       // println(q)
 
-      // q.dequeueAll.toStream.map({case (_, lab, c) => (lab, c)})
+      //       val (cOpt, countsNew) = h.counts.mergeSubtreeCheckCherry(lab, _+_)
 
-      // SSCCCAAAALLLLAAAAAA!!!!!
-      counts.internal(0, _+_).sortBy({
-        case (lab, cacc) => (prio(lab, cacc, tree.volumeAt(lab)), lab, cacc)
-      })(BacktrackOrder).toStream
+      //       println(lab)
+      //       println(cOpt)
+      //       // println(countsNew)
+
+      //       val hnew = Histogram(h.tree, h.totalCount, countsNew)
+
+      //       cOpt match {
+      //         case None => ()
+      //         case Some((cLab, cCnt)) => q += ((prio(cLab, cCnt, tree.volumeAt(cLab)), cLab))
+      //       }
+
+      //       (lab, hnew)
+      //     }
+      // }.tail.takeWhile(_._1 != NodeLabel(0)) //Ugly HACK part 2
     }
 
-    def backtrack[H](prio : PriorityFunction[H])(implicit ord : Ordering[H]) : Stream[Histogram] = {
-      backtrackNodes(prio).scanLeft(this) {
-        // NOTE: This results in two extra lookups, but is nicer API-wise
-        case (h : Histogram, (lab, _)) =>
-          // println(lab)
-          val newCounts = h.counts.mergeSubtree(lab, _+_)
-          // assert(!counts.truncation.leaves.contains(lab))
-          assert(counts.truncation.subtree(lab).size > 0)
-          // assert(counts.truncation.leaves(counts.truncation.subtree(lab).lower) != lab)
-          if(!newCounts.truncation.leaves.contains(lab)) {
-            // TODO: Debug
-            // print("Lv1: ")
-            // println(counts.truncation.leaves.toList)
-            // print("Lv2: ")
-            // println(newCounts.truncation.leaves.toList)
-            // print("Lab: ")
-            // println(lab)
-            // println("...")
-            // print("SS1: ")
-            // println(counts.truncation.slice(counts.truncation.subtree(lab)).toList)
-            // print("SS2: ")
-            // println(newCounts.truncation.slice(counts.truncation.subtree(lab)).toList)
-            // assert(newCounts.truncation.leaves.contains(lab))
-          }
-          Histogram(tree, totalCount, newCounts)
-      }.tail
-    }
+    def backtrackNodes[H](prio : PriorityFunction[H])(implicit ord : Ordering[H])
+        : Iterator[NodeLabel] =
+      backtrackWithNodes(prio)(ord).map(_._1)
+
+    def backtrack[H](prio : PriorityFunction[H])(implicit ord : Ordering[H])
+        : Iterator[Histogram] =
+      backtrackWithNodes(prio)(ord).map(_._2)
+
+    //   backtrackNodes(prio).scanLeft(this) {
+    //     // NOTE: This results in two extra lookups, but is nicer API-wise
+    //     case (h : Histogram, (lab, _)) =>
+    //       // println(lab)
+    //       val newCounts = h.counts.mergeSubtree(lab, _+_)
+    //       // assert(!counts.truncation.leaves.contains(lab))
+    //       assert(counts.truncation.subtree(lab).size > 0)
+    //       // assert(counts.truncation.leaves(counts.truncation.subtree(lab).lower) != lab)
+    //       if(!newCounts.truncation.leaves.contains(lab)) {
+    //         // TODO: Debug
+    //         // print("Lv1: ")
+    //         // println(counts.truncation.leaves.toList)
+    //         // print("Lv2: ")
+    //         // println(newCounts.truncation.leaves.toList)
+    //         // print("Lab: ")
+    //         // println(lab)
+    //         // println("...")
+    //         // print("SS1: ")
+    //         // println(counts.truncation.slice(counts.truncation.subtree(lab)).toList)
+    //         // print("SS2: ")
+    //         // println(newCounts.truncation.slice(counts.truncation.subtree(lab)).toList)
+    //         // assert(newCounts.truncation.leaves.contains(lab))
+    //       }
+    //       Histogram(tree, totalCount, newCounts)
+    //   }.tail
+    // }
   }
 
   ////////
@@ -762,7 +975,7 @@ object ScalaDensity {
   }
 
   def testRun() : Histogram = {
-    val dfnum = 100000
+    val dfnum = 5000
     val dfdim = 3
     Logger.getLogger("org").setLevel(Level.ERROR)
     Logger.getLogger("akka").setLevel(Level.ERROR)

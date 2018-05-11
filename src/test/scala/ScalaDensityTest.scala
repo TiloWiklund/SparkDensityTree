@@ -21,7 +21,7 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   private var bb : Rectangle = null
   private var h : Histogram = null
 
-  private val dfnum = 10000
+  private val dfnum = 5000
   private val dfdim = 3
     // val df = normalVectorRDD(sc, n, 2)
 
@@ -98,22 +98,22 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     assert(ancestry1 === ancestry2)
   }
 
-  "new left/right ordering" should "agree with the old one" in {
-    def isAncestorOfOld(a : NodeLabel, b : NodeLabel) : Boolean =
-      a.lab < b.lab && (b.ancestor(b.depth - a.depth) == a)
+  // "new left/right ordering" should "agree with the old one" in {
+  //   def isAncestorOfOld(a : NodeLabel, b : NodeLabel) : Boolean =
+  //     a.lab < b.lab && (b.ancestor(b.depth - a.depth) == a)
 
-    def isLeftOfOld(a : NodeLabel, b : NodeLabel) : Boolean =
-      a.truncate(b.depth).lab < b.truncate(a.depth).lab
+  //   def isLeftOfOld(a : NodeLabel, b : NodeLabel) : Boolean =
+  //     a.truncate(b.depth).lab < b.truncate(a.depth).lab
 
-    val l = rootLabel.left
-    val r = rootLabel.right
-    val lll = l.left.left
+  //   val l = rootLabel.left
+  //   val r = rootLabel.right
+  //   val lll = l.left.left
 
-    assert(isAncestorOfOld(l, lll) === isAncestorOf(l, lll))
-    assert(isAncestorOfOld(l, r) === isAncestorOf(l, r))
-    assert(isLeftOfOld(l, lll) === isLeftOf(l, lll))
-    assert(isLeftOfOld(l, r) === isLeftOf(l, r))
-  }
+  //   assert(isAncestorOfOld(l, lll) === isAncestorOf(l, lll))
+  //   assert(isAncestorOfOld(l, r) === isAncestorOf(l, r))
+  //   assert(isLeftOfOld(l, lll) === isLeftOf(l, lll))
+  //   assert(isLeftOfOld(l, r) === isLeftOf(l, r))
+  // }
 
   "MRSName" should "work on test cases" in {
     val lrllr = rootLabel.left.right.left.left.right
@@ -160,11 +160,11 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   //   assert(!isAncestorOf(lab.rightmostAncestor.right, lab))
   // }
 
-  "path" should "be an open interval" in {
+  "path" should "be a sorted open interval" in {
     val start = rootLabel.left.right.left.left.left.right
     val stop  = rootLabel.right.left.left.right
     val p = path(start, stop)
-    assert(p === p.sorted(leftRightOrd))
+    p.sliding(2).foreach(x => assert(adjacent(x(0), x(1))))
     assert(adjacent(p.head, start))
     assert(adjacent(p.last, stop))
     assert(path(start, start).isEmpty)
@@ -331,6 +331,26 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     }
   }
 
+  def assertdistinct[A](a : Seq[A]) : Unit = {
+    a.tails.foreach {
+      case Seq(x, xs@_*) => xs.foreach {
+        case y => assert(y != x)
+      }
+      case Seq() => ()
+    }
+  }
+
+  "cherries" should "all be cherries" in {
+    h.counts.cherries(_+_).foreach {
+      case (lab, _) => assert(h.counts.truncation.hasAsCherry(lab))
+    }
+  }
+
+  it should "give distinct ones" in {
+    // println(h.counts.cherries(_+_).map(_._1).toVector)
+    assertdistinct(h.counts.cherries(_+_).map(_._1).toSeq)
+  }
+
   "splitAndCountFrom" should "have only non-splittable boxes and splittable parents" in {
     val tree = spatialTreeRootedAt(bb)
     val counts = splitAndCountFrom(tree, rootTruncation, df, lims, noEarlyStop)
@@ -391,7 +411,7 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     assert(internals1 === internals2)
   }
 
-  "backtrack" should "have things in priority order" in {
+  "backtrack" should "traverses all ancestors in correct order" in {
     def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
     // def lims(tv : Volume, tc : Count)(d : Int, v : Volume, c : Count) : Boolean =
     //   c > 100 || (1 - c/tc)*v/tv > 0.1
@@ -406,17 +426,17 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     //   filter(x => h.counts.truncation.leaves.exists(isAncestorOf(x, _))).
     //   size
 
-    val bt = h.backtrackNodes(prio)
+    val bt = h.backtrackWithNodes(prio).toVector.toStream
 
     bt.tails.foreach {
       case Stream.Empty => ()
-      case ((lab1, c1) #:: rest) =>
+      case ((lab1, h1) #:: rest) =>
         rest.foreach {
-          case (lab2, c2) => assert(!isAncestorOf(lab1, lab2))
+          case (lab2, _) => assert(!isAncestorOf(lab1, lab2))
         }
-        rest.foreach {
-          case (lab2, c2) => assert(isAncestorOf(lab2, lab1) || c1 <= c2)
-        }
+        // rest.foreach {
+        //   case (lab2, h2) => assert(isAncestorOf(lab2, lab1) || c1 <= c2)
+        // }
         rest.exists {
           case (lab2, _) => lab2 === lab1.parent
         }
@@ -427,7 +447,7 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
 
     h.backtrackNodes(prio).foreach {
-      case (n, _) =>
+      case n =>
         h.counts.truncation.leaves.exists {
           case n2 =>
             isAncestorOf(n, n2)
@@ -435,24 +455,41 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     }
   }
 
+  it should "traverse everything once" in {
+    def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    val tracked = h.backtrackNodes(prio).toVector.toStream
+    assertdistinct(tracked)
+  }
+
+  it should "end in trivial histogram" in {
+    def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+
+    assert(h.backtrack(prio).toStream.last.counts.truncation.leaves === Vector(rootLabel))
+  }
+
   it should "traverse all ancestors" in {
     def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
 
-    val tracked = h.backtrackNodes(prio).map(_._1).toSet
-    h.counts.truncation.leaves.foreach {
-      case c =>
-        c.ancestors.foreach {
-          case a =>
-            assert(tracked(a))
-        }
-    }
+    h.backtrack(prio).toVector.reverse.take(10).foreach(x=>println(x.counts.truncation.leaves))
+
+    val tracked = h.backtrackNodes(prio).toSet
+    val full = h.counts.truncation.leaves.toSet.flatMap((x : NodeLabel) => x.ancestors())
+    assert((tracked -- full).isEmpty)
+    assert((full -- tracked).isEmpty)
+    // h.counts.truncation.leaves.foreach {
+    //   case c =>
+    //     c.ancestors.foreach {
+    //       case a =>
+    //         assert(tracked(a))
+    //     }
+    // }
   }
 
   it should "remove the correct leaf node" in {
     def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
 
-    h.backtrack(prio).zip(h.backtrackNodes(prio).map(_._1).sliding(2).toStream).foreach {
-      case (h1, (n1 #:: n2 #:: _)) =>
+    h.backtrackWithNodes(prio).toStream.sliding(2).toStream.foreach {// .zip(h.backtrackNodes(prio).sliding(2).toStream).foreach {
+      case ((n1, h1) #:: (n2, _) #:: _) =>
         assert(h1.counts.truncation.leaves.contains(n1))
         assert(!h1.counts.truncation.leaves.contains(n1.left))
         assert(!h1.counts.truncation.leaves.contains(n1.right))
@@ -473,8 +510,9 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     //     print("Backtrack Result: ")
     //     println(x.truncation.leaves.toList)
     // }
-    h.backtrack(prio).sliding(2).toStream.zip(h.backtrackNodes(prio).map(_._1).toStream.tail).foreach {
-      case ((h1 #:: h2 #:: rest), lab) =>
+    // h.backtrack(prio).toStream.sliding(2).zip(h.backtrackNodes(prio).toStream.tail).foreach {
+    h.backtrack(prio).toStream.sliding(2).foreach {
+      case (h1 #:: h2 #:: rest) =>
         // print(h1.truncation.leaves.toList)
         // print("--")
         // println(h2.truncation.leaves.toList)
@@ -483,25 +521,25 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
         // println(diff1)
         // println(diff2)
 
-        if(diff1.size != 1 && diff1.size != 2) {
-          println("----------------------")
-          println(h1.counts.truncation.subtree(lab))
-          println("----------------------")
-          println(h1.counts.truncation.leaves.filter(isAncestorOf(lab, _)))
-          println("--------------------!!")
-          println(h.counts.truncation.leaves.filter(isAncestorOf(lab, _)))
-          println("----------------------")
-          println(lab)
-          println("----------------------")
-          println(diff1)
-          println("----------------------")
-          println(diff2)
-          println("----------------------")
-          println(h1)
-          println("----------------------")
-          println(h2)
-          println("----------------------")
-        }
+        // if(diff1.size != 1 && diff1.size != 2) {
+        //   println("----------------------")
+        //   println(h1.counts.truncation.subtree(lab))
+        //   println("----------------------")
+        //   println(h1.counts.truncation.leaves.filter(isAncestorOf(lab, _)))
+        //   println("--------------------!!")
+        //   println(h.counts.truncation.leaves.filter(isAncestorOf(lab, _)))
+        //   println("----------------------")
+        //   println(lab)
+        //   println("----------------------")
+        //   println(diff1)
+        //   println("----------------------")
+        //   println(diff2)
+        //   println("----------------------")
+        //   println(h1)
+        //   println("----------------------")
+        //   println(h2)
+        //   println("----------------------")
+        // }
 
         assert(diff1.size === 1 || diff1.size === 2)
         assert(diff2.size === 1)

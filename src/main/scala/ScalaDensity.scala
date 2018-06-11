@@ -641,6 +641,17 @@ object ScalaDensity {
   //   }
   // }
 
+  type Probability = Double
+
+  case class TailProbabilities(tree : SpatialTree, tails : LeafMap[Probability]) {
+    def query(v : MLVector) : Double = {
+      tails.query(tree.descendBox(v)) match {
+        case (_, None)    => 0
+        case (_, Some(p)) => p
+      }
+    }
+  }
+
   case class Histogram(tree : SpatialTree, totalCount : Count, counts : LeafMap[Count]) {
     def density(v : MLVector) : Double = {
       counts.query(tree.descendBox(v)) match {
@@ -648,6 +659,20 @@ object ScalaDensity {
         case (at, Some(c)) =>
           c / (totalCount * tree.volumeAt(at))
       }
+    }
+
+    def tailProbabilities() : TailProbabilities = {
+      val quantiles = counts.toIterable.map {
+        case (lab, c) => (lab, c/(totalCount * tree.volumeAt(lab)), c)
+      }.toVector.sortBy {
+        case (lab, d, p) => d
+      }.toIterable.scanLeft((rootLabel, 0L)) {
+        case ((_, c1), (lab, _, c2)) => (lab, c2 + c1)
+      }.tail.map {
+        case (lab, c) => (lab, c/(1.0*totalCount))
+      }.toMap
+
+      TailProbabilities(tree, fromNodeLabelMap(quantiles))
     }
 
     def truncation() : Truncation = counts.truncation

@@ -20,12 +20,12 @@ libraryDependencies += "org.apache.spark" %% "spark-mllib" % "2.2.0" // % "provi
 
 libraryDependencies += "org.scalatest" %% "scalatest" % "3.0.4" % "test"
 
-val meta = """META.INF(.)*""".r
+//val meta = """META.INF(.)*""".r
 
-assemblyMergeStrategy in assembly := {
-  case "BUILD" => MergeStrategy.discard
-  case "META-INF/MANIFEST.MF" => MergeStrategy.discard
-  case meta(_)  => MergeStrategy.last // or MergeStrategy.discard, your choice
-  case other => MergeStrategy.defaultMergeStrategy(other)
-}
+//assemblyMergeStrategy in assembly := {
+//  case "BUILD" => MergeStrategy.discard
+//  case "META-INF/MANIFEST.MF" => MergeStrategy.discard
+//  case meta(_)  => MergeStrategy.last // or MergeStrategy.discard, your choice
+//  case other => MergeStrategy.defaultMergeStrategy(other)
+//}
 

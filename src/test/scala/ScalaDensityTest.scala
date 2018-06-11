@@ -585,93 +585,23 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     assert(m.truncation.leaves.contains(l))
   }
 
-  // "descend" should "be a decreasing sequence termining in empty" in {
+  "tailProbabilities" should "should be probabilities, attaining maximum 1" in {
+    val tp = h.tailProbabilities()
+    tp.tails.vals.foreach {
+      case p =>
+        assert(0 <= p)
+        assert(p <= 1)
+    }
+    assert(tp.tails.vals.max === 1)
+  }
 
-  // }
-
-  // "rootTree" should "have root node as leaf" in {
-  //   val tree = rootTree(())
-  //   assert(tree.hasLeaf(rootLabel))
-  // }
-
-  // it should "replace root node after split" in {
-  //   def s(x : Unit) : (Unit, Unit) = ((), ())
-
-  //   val tree = rootTree(())
-  //   val splitTree = tree.splitLeaf(rootLabel, s)
-  //   assert(!splitTree.hasLeaf(rootLabel))
-  //   assert(splitTree.hasLeaf(rootLabel.left))
-  //   assert(splitTree.hasLeaf(rootLabel.right))
-  // }
-
-  // "depth first traversal" should "contain exactly ancestors exactly once" in {
-  //   def s(x : Unit) : (Unit, Unit) = ((), ())
-
-  //   val tree = rootTree(()).
-  //     splitLeaf(rootLabel, s).
-  //     splitLeaf(rootLabel.left, s).
-  //     splitLeaf(rootLabel.left.left, s).
-  //     splitLeaf(rootLabel.left.left.left, s).
-  //     splitLeaf(rootLabel.left.left.right, s).
-  //     splitLeaf(rootLabel.left.right, s).
-  //     splitLeaf(rootLabel.right, s).
-  //     splitLeaf(rootLabel.right.left, s).
-  //     splitLeaf(rootLabel.right.left.right, s).
-  //     splitLeaf(rootLabel.right.right, s).
-  //     splitLeaf(rootLabel.right.right.left, s)
-
-  //   val leaves = tree.leafNodes
-  //   val ancestors1 = leaves.flatMap(x => x.ancestors.toSet)
-  //   val dft = tree.dftInternal
-  //   val ancestors2 = dft.toSet
-
-  //   assert(ancestors1 === ancestors2)
-  //   assert(dft.toSet.size === dft.length)
-  // }
-
-  // "PCFunction" should "retain root box after split and merge" in {
-
-  //   def s(x : Unit) : (Unit, Unit) = ((), ())
-
-  //   val pcf1 = constantPCFunction(bb, ())
-  //   val pcf2 = pcf1.splitCell(rootLabel, { _ => ((), ()) }).mergeCell(rootLabel, { (_, _) => () })
-
-  //   equal(pcf1, pcf2)
-  // }
-
-  // it should "halv volume at each split" in {
-  //   def s(x : Unit) : (Unit, Unit) = ((), ())
-
-  //   var f = constantPCFunction(bb, ())
-  //   val (lab1, box1, _) = f(rootLabel)
-  //   f = f.splitCell(rootLabel, s)
-  //   val (lab2, box2, _) = f(rootLabel.right)
-  //   f = f.splitCell(rootLabel.right, s)
-  //   val (lab3, box3, _) = f(rootLabel.right.right)
-  //   assert(bb.volume / pow(2, lab1.depth) === box1.volume)
-  //   assert(bb.volume / pow(2, lab2.depth) === box2.volume)
-  //   assert(bb.volume / pow(2, lab3.depth) === box3.volume)
-  // }
-
-  // "density" should "should not depend on partition" in {
-  //   val h1 = Histogram(100, bb.volume, constantPCFunction(bb, 100L))
-  //   val h2 = Histogram(100, bb.volume, constantPCFunction(bb, 100L).
-  //                        splitCell(rootLabel, _ => (50L, 50L)))
-  //   assert(h1.density(rootLabel) === h2.density(rootLabel.left))
-  //   assert(h1.density(rootLabel) === h2.density(rootLabel.right))
-  // }
-
-  // "likelihood" should "should not depend on partition" in {
-  //   val h1 = Histogram(100, bb.volume, constantPCFunction(bb, 100L))
-  //   val h2 = Histogram(100, bb.volume, constantPCFunction(bb, 100L).
-  //                        splitCell(rootLabel, _ => (50L, 50L)))
-  //   assert(h1.logLik() === h2.logLik())
-  // }
-
-  // "LOO-error approx" should "should not depend on partition" in {
-  //   val h1 = Histogram(100, bb.volume, constantPCFunction(bb, 100L))
-  //   val h2 = Histogram(100, bb.volume, constantPCFunction(bb, 100L).
-  //                        splitCell(rootLabel, _ => (50L, 50L)))
-  //   assert(h1.looL2ErrorApprox() === h2.looL2ErrorApprox())
-  // }
+  it should "have tail 0/1 in minimum/maximum density cell" in {
+    val tp   = h.tailProbabilities()
+    val imax = tp.tails.vals.zipWithIndex.maxBy(_._1)._2
+    val imin = tp.tails.vals.zipWithIndex.minBy(_._1)._2
+    val cmax = h.counts.vals(imax)
+    val cmin = h.counts.vals(imin)
+    assert(cmax === h.counts.vals.max)
+    assert(cmin === h.counts.vals.min)
+  }
 }

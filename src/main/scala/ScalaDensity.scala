@@ -34,6 +34,8 @@ import org.apache.spark.{ SparkContext, SparkConf }
 import org.apache.spark.sql.SQLContext
 import org.apache.log4j.{ Logger, Level }
 
+import java.io.{File, PrintWriter}
+
 // import scala.util.Sorting
 
 object ScalaDensity {
@@ -207,6 +209,12 @@ object ScalaDensity {
 
   def adjacent(a : NodeLabel, b : NodeLabel) : Boolean =
     a.parent == b || b.parent == a
+
+  def pathLeftClosed(from : NodeLabel, to : NodeLabel) : Stream[NodeLabel] =
+    if(from == to) Stream.empty else from #:: path(from, to)
+
+  def pathRightClosed(from : NodeLabel, to : NodeLabel) : Stream[NodeLabel] =
+    if(from == to) Stream.empty else path(from, to) #::: Stream(to)
 
   def path(from : NodeLabel, to : NodeLabel) : Stream[NodeLabel] = {
     if(from == to) {
@@ -437,18 +445,29 @@ object ScalaDensity {
         val lastLeaf = leaves.last
         val llim = firstLeaf.truncate(firstLeaf.initialLefts)
         val rlim = lastLeaf.truncate(lastLeaf.initialRights)
-        val l : Stream[(NodeLabel, Option[Int])] = if(llim != firstLeaf) Stream((llim, none())) else Stream.empty
-        val r : Stream[(NodeLabel, Option[Int])] = if(rlim != lastLeaf) Stream((rlim, none())) else Stream.empty
+        val l : Stream[(NodeLabel, Option[Int])] = if(llim != firstLeaf) Stream((llim.left, none())) else Stream.empty
+        val r : Stream[(NodeLabel, Option[Int])] = if(rlim != lastLeaf) Stream((rlim.right, none())) else Stream.empty
         val c : Stream[(NodeLabel, Option[Int])] = leaves.toStream.zip(0 until leaves.length).map(x => (x._1, some(x._2)))
 
         val leavesWidened : Stream[(NodeLabel, Option[Int])] = l #::: c #::: r
 
         val leavesFilled : Stream[(NodeLabel, Option[Int])] = leavesWidened.sliding(2).flatMap {
           case ((llab, _) #:: (rlab, rval) #:: Stream.Empty) =>
-            val j = join(llab, rlab)
-            val upPath   = path(llab, j.left).filter(_.isLeft).map(x => (x.sibling, none()))
-            val downPath = path(j.right, rlab).filter(_.isRight).map(x => (x.sibling, none()))
-            upPath #::: downPath #::: Stream((rlab, rval))
+            if(llab == rlab.sibling) {
+              Stream((rlab, rval))
+            } else {
+              val j = join(llab, rlab)
+              val rightFilled = pathLeftClosed(llab, j.left).
+                filter(_.isLeft).
+                map(x => (x.sibling, none()))
+
+
+              val leftFilled = pathRightClosed(j.right, rlab).
+                filter(_.isRight).
+                map(x => (x.sibling, none()))
+
+              rightFilled #::: leftFilled #::: Stream((rlab, rval))
+            }
         }.toStream
 
         leavesWidened.head #:: leavesFilled
@@ -1008,7 +1027,48 @@ object ScalaDensity {
     val sc = new SparkContext(conf)
     val df = normalVectorRDD(sc, dfnum, dfdim, 6, 7387389).cache()
     def lims(totalVolume : Double, totalCount : Count)(depth : Int, volume : Volume, count : Count) =
-      count > dfnum/2 || (1 - count/totalCount)*volume > 0.001*totalVolume
+      count > dfnum/2 || (1 - count/totalCount)*volume > 0.01*totalVolume
     histogram(df, lims, noEarlyStop)
+  }
+
+  def raazRun() = {
+    val h = testRun()
+
+    val bbF = new PrintWriter(new File("/home/tilo/Project/Research/distributed-histogram-trees/raaz_thing/rootBox.txt"))
+    try {
+      for( (l, h) <- h.tree.rootCell.factorise() ) {
+        bbF.write(s"[$l,$h]\n")
+      }
+    } finally {
+      bbF.close()
+    }
+
+
+    val smallnodeF = new PrintWriter(new File("/home/tilo/Project/Research/distributed-histogram-trees/raaz_thing/smallnodes.txt"))
+    try {
+      for(lab <- h.counts.truncation.leaves) {
+        smallnodeF.write(f"${lab.lab}%d\n")
+      }
+    } finally {
+      smallnodeF.close()
+    }
+
+    val denseF = new PrintWriter(new File("/home/tilo/Project/Research/distributed-histogram-trees/raaz_thing/ranges.txt"))
+    val depthF = new PrintWriter(new File("/home/tilo/Project/Research/distributed-histogram-trees/raaz_thing/ldfn.txt"))
+    val nodeF = new PrintWriter(new File("/home/tilo/Project/Research/distributed-histogram-trees/raaz_thing/nodes.txt"))
+    try {
+      for((l,maybec) <- h.counts.minimalCompletionNodes()) {
+        depthF.write(f"${l.depth}%d\n")
+        nodeF.write(f"${l.lab}%d\n")
+        maybec match {
+          case Some(c) => denseF.write(f"${c / (h.totalCount * h.tree.volumeAt(l))}%2.2f\n")
+          case None    => denseF.write(f"${0}%2.2f\n")
+        }
+      }
+    } finally {
+      denseF.close()
+      depthF.close()
+      nodeF.close()
+    }
   }
 }

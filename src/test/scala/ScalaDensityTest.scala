@@ -208,14 +208,7 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   }
 
   it should "have completion be a finite tree" in {
-    // TODO: Change this to some determinstic tree instead of hist!
-    // def lims(tv : Volume, tc : Count)(d : Int, v : Volume, c : Count) : Boolean =
-    //   c > 100 || (1 - c/tc)*v/tv > 0.1
-
-    // val h = histogram(df, lims)
-
-    // val leaves = h.counts.truncation.leaves.toSet
-
+    // TODO: Something is wrong with this test, didn't catch a bad bug!
 
     val leaves1 = Set(rootLabel.left.left.right, rootLabel.right.left)
     val trunc = fromLeafSet(leaves1)
@@ -224,6 +217,11 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     // println(leaves1)
     // print("Completed: ")
     // println(leaves)
+
+    leaves.foreach {
+      case l =>
+        assert(!leaves.exists(isAncestorOf(_,l)))
+    }
 
     val d = leaves.map(_.depth).max + 1
     var nodes = Set(rootLabel)
@@ -470,7 +468,7 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   it should "traverse all ancestors" in {
     def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
 
-    h.backtrack(prio).toVector.reverse.take(10).foreach(x=>println(x.counts.truncation.leaves))
+    // h.backtrack(prio).toVector.reverse.take(10).foreach(x=>println(x.counts.truncation.leaves))
 
     val tracked = h.backtrackNodes(prio).toSet
     val full = h.counts.truncation.leaves.toSet.flatMap((x : NodeLabel) => x.ancestors())

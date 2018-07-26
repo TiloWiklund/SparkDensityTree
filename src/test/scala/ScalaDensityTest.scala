@@ -428,15 +428,15 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
 
     bt.tails.foreach {
       case Stream.Empty => ()
-      case ((lab1, h1) #:: rest) =>
+      case ((_, lab1, h1) #:: rest) =>
         rest.foreach {
-          case (lab2, _) => assert(!isAncestorOf(lab1, lab2))
+          case (_, lab2, _) => assert(!isAncestorOf(lab1, lab2))
         }
         // rest.foreach {
         //   case (lab2, h2) => assert(isAncestorOf(lab2, lab1) || c1 <= c2)
         // }
         rest.exists {
-          case (lab2, _) => lab2 === lab1.parent
+          case (_, lab2, _) => lab2 === lab1.parent
         }
     }
   }
@@ -487,7 +487,7 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
 
     h.backtrackWithNodes(prio).toStream.sliding(2).toStream.foreach {// .zip(h.backtrackNodes(prio).sliding(2).toStream).foreach {
-      case ((n1, h1) #:: (n2, _) #:: _) =>
+      case ((_, n1, h1) #:: (_, n2, _) #:: _) =>
         assert(h1.counts.truncation.leaves.contains(n1))
         assert(!h1.counts.truncation.leaves.contains(n1.left))
         assert(!h1.counts.truncation.leaves.contains(n1.right))
@@ -602,4 +602,82 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     assert(cmax === h.counts.vals.max)
     assert(cmin === h.counts.vals.min)
   }
+
+  "fringes" should "have inverse concatLeafmap" in {
+    val parentTrunc = h.counts.truncation match {
+      case Truncation(leaves) => Truncation(leaves.map(_.parent).distinct)
+    }
+    assert(concatLeafMaps(fringes(h.counts, parentTrunc).vals).vals == h.counts.vals)
+  }
+
+  it should "have subtree at each key" in {
+    val parentTrunc = h.counts.truncation match {
+      case Truncation(leaves) => Truncation(leaves.map(_.parent).distinct)
+    }
+    val fs = fringes(h.counts, parentTrunc)
+    fs.truncation.leaves.zip(fs.vals).foreach {
+      case (p, LeafMap(Truncation(ls), _)) =>
+        assert(ls.forall(isAncestorOf(p, _)))
+    }
+  }
+
+  "backtrackTo" should "behave like backtrack when target is root" in {
+    def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+
+    val bt  = h.backtrackWithNodes(prio).toStream
+    val btT = h.backtrackToWithNodes(prio,bt.last._3).toStream
+
+    assert(bt.length === btT.length)
+    btT.zip(bt).foreach {
+      case ((p1, lab1, h1), (p2, lab2, h2)) =>
+        assert(p1 === p2)
+        assert(lab1 === lab2)
+        assert(h1.counts.truncation.leaves === h2.counts.truncation.leaves)
+        assert(h1.counts.vals === h2.counts.vals)
+    }
+  }
+
+  "backtrackTo" should "behave like prefix of backtrack when target is intermediate node" in {
+    def prio(lab : NodeLabel, c : Count, v : Volume) : (Count, BigInt) = (c, lab.lab)
+
+    val bt  = h.backtrackWithNodes(prio).toStream
+    assert(bt.length > 20)
+    val btT = h.backtrackToWithNodes(prio,bt.takeRight(15).head._3).toStream
+
+    assert(bt.length === btT.length+15-1)
+    assert(btT.map(_._2) == bt.map(_._2).take(btT.length))
+    assert(btT.map(_._1) == bt.map(_._1).take(btT.length))
+    btT.zip(bt).zipWithIndex.foreach {
+      case (((_, _, h1), (_, _, h2)), i) =>
+        val l1 = h1.counts.truncation.leaves.toSet
+        val l2 = h2.counts.truncation.leaves.toSet
+        val v1 = h1.counts.vals.toSet
+        val v2 = h2.counts.vals.toSet
+        assert((i, l1 -- l2) === (i, Set.empty))
+        assert((i, l2 -- l1) === (i, Set.empty))
+        assert((i, v1 -- v2) === (i, Set.empty))
+        assert((i, v2 -- v1) === (i, Set.empty))
+    }
+  }
+
+  // "backtrackTo" should "end in the target histogram" in {
+  //   def supportCarveLim(totalVolume : Double, totalCount : Count)(depth : Int, volume : Volume, count : Count) =
+  //     count > dfnum/2 || (1 - count/totalCount)*volume/totalVolume > 0.01
+
+  //   def countLim(totalVolume : Double, totalCount : Count)(depth : Int, volume : Volume, count : Count) =
+  //     count > 5
+
+  //   // factor out totalCount and totalVolume since they are the same for all nodes
+  //   def supportCarvePriority(lab : NodeLabel, c : Count, v : Volume) : Double = (1 - c)*v
+  //   def countPriority(lab : NodeLabel, c : Count, v : Volume) : Count = c
+
+  //   val supportCarvedH = histogram(df, supportCarveLim, noEarlyStop)
+  //   val tributaryH = histogramStartingWith(supportCarvedH, df, countLim, noEarlyStop)
+  //   val btT = tributaryH.backtrackToWithNodes(countPriority, supportCarvedH)
+  //   // println(btT.map(_._3.counts.vals.take(4).toVector))
+  //   val l = btT.toStream.last._3
+
+  //   assert(l.truncation.leaves === supportCarvedH.truncation.leaves)
+  //   assert(l.counts.vals === supportCarvedH.counts.vals)
+  // }
 }

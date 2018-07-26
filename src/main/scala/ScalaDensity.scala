@@ -802,6 +802,12 @@ object ScalaDensity {
     def backtrack[H](prio : PriorityFunction[H])(implicit ord : Ordering[H])
         : Iterator[Histogram] =
       backtrackWithNodes(prio)(ord).map(_._3)
+
+    def backtrackNodes[H](prio : PriorityFunction[H], hparent : Histogram)(implicit ord : Ordering[H]) : Iterator[NodeLabel] =
+      backtrackToWithNodes(prio, hparent)(ord).map(_._2)
+
+    def backtrackTo[H](prio : PriorityFunction[H], hparent : Histogram)(implicit ord : Ordering[H]) : Iterator[Histogram] =
+      backtrackToWithNodes(prio, hparent)(ord).map(_._3)
   }
 
   // WARNING: Does not check coherent ordering or same bounding box/tree!
@@ -981,7 +987,6 @@ object ScalaDensity {
     } finally {
       bbF.close()
     }
-
 
     val smallnodeF = new PrintWriter(new File("/home/tilo/Project/Research/distributed-histogram-trees/raaz_thing/smallnodes.txt"))
     try {

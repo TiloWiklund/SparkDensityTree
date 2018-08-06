@@ -46,7 +46,7 @@ object ScalaDensity {
   type Intercept = Double
   type Volume = Double
 
-  case class Rectangle(low : Vector[Double], high : Vector[Double]) {
+  case class Rectangle(low : Vector[Double], high : Vector[Double]) extends Serializable {
     def factorise() : Iterator[(Double, Double)] = low.toIterator.zip(high.toIterator)
     override def toString = factorise().mkString("x")
 
@@ -98,7 +98,7 @@ object ScalaDensity {
 
   type Depth = Int
 
-  case class NodeLabel(lab : BigInt) {
+  case class NodeLabel(lab : BigInt) extends Serializable {
     private val rootLabel : BigInt = 1
 
     def    left() : NodeLabel = NodeLabel(2*lab)
@@ -242,7 +242,7 @@ object ScalaDensity {
   case class CachedUnfoldTree[A]( base : A,
                                  cache : Map[NodeLabel, A],
                                   left : (NodeLabel, A) => A,
-                                 right : (NodeLabel, A) => A) {
+                                 right : (NodeLabel, A) => A) extends Serializable {
     def apply(lab : NodeLabel) : A = {
       val inCache : NodeLabel = (lab.ancestors.dropWhile(!cache.isDefinedAt(_)) #::: Stream(rootLabel)).head
       val startWith : A = if(inCache == rootLabel) base else cache(inCache)
@@ -278,7 +278,7 @@ object ScalaDensity {
   // Leaf-labelled finite (truncated) binary trees
 
   // TODO: Can we make efficient splices part of Truncation instead?
-  case class Subset(lower : Int, upper : Int) {
+  case class Subset(lower : Int, upper : Int) extends Serializable {
     def size() : Int = upper - lower
     def isEmpty() : Boolean = size() == 0
     def midpoint() : Int = (upper + lower)/2 // Should round down
@@ -336,7 +336,7 @@ object ScalaDensity {
 
   type Walk = Stream[NodeLabel]
 
-  case class Truncation(leaves : Vector[NodeLabel]) {
+  case class Truncation(leaves : Vector[NodeLabel]) extends Serializable {
     // TODO: Make this a more efficent binary search
     def subtreeWithin(at : NodeLabel, within : Subset) : Subset = {
       val low = binarySearchWithin((x : NodeLabel) => !isStrictLeftOf(x, at))(leaves, within)
@@ -488,7 +488,7 @@ object ScalaDensity {
   def some[A](a : A) : Option[A] = Some(a)
   def none[A]() : Option[A] = None
 
-  case class LeafMap[A:ClassTag](truncation : Truncation, vals : Vector[A]) {
+  case class LeafMap[A:ClassTag](truncation : Truncation, vals : Vector[A]) extends Serializable {
     // TODO: Optimise?
     def query(labs : Walk) : (NodeLabel, Option[A]) = {
       val (at, ss) = truncation.descendUntilLeafWhere(labs)
@@ -604,7 +604,7 @@ object ScalaDensity {
   ////////
 
   // TODO: Can we figure out some clever way to do memoisation/caching?
-  case class SpatialTree(rootCell : Rectangle) {
+  case class SpatialTree(rootCell : Rectangle) extends Serializable {
     def dimension() : Int = rootCell.dimension
 
     def volumeTotal() : Double = rootCell.volume
@@ -666,7 +666,19 @@ object ScalaDensity {
     }
   }
 
-  case class Histogram(tree : SpatialTree, totalCount : Count, counts : LeafMap[Count]) {
+  case class Histogram(tree : SpatialTree, totalCount : Count, counts : LeafMap[Count]) extends Serializable {
+    def save(filename : String) : Unit = {
+      val f = new PrintWriter(new File(filename))
+      for(c <- tree.rootCell.low) { f.write(c.toString); f.write(", ") }
+      f.write("\n")
+      for(c <- tree.rootCell.high) { f.write(c.toString); f.write(", ") }
+      f.write("\n")
+      for(c <- counts.truncation.leaves) { f.write(c.lab.toString); f.write(", ") }
+      f.write("\n")
+      for(c <- counts.vals) { f.write(c.toString); f.write(", ") }
+      f.close()
+    }
+
     def density(v : MLVector) : Double = {
       counts.query(tree.descendBox(v)) match {
         case (_, None) => 0
@@ -819,7 +831,7 @@ object ScalaDensity {
   type Count = Long
 
   // TODO: This should maybe be parameterised over Count/countByKey as well
-  case class Partitioned[A](points : RDD[(BigInt, A)]) {
+  case class Partitioned[A](points : RDD[(BigInt, A)]) extends Serializable {
     def splittable(shouldSplit : (NodeLabel, Count) => Boolean) : (Map[NodeLabel, Count], Map[NodeLabel, Count]) = {
       // TODO: Why is keyBy needed, it should be noop here?!?
       // NOTE: This is needed to make things work in SparkREPL/DB, and maybe save some space if Spark/Scala are dumb

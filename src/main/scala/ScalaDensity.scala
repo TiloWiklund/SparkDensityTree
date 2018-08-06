@@ -437,9 +437,11 @@ object ScalaDensity {
 
     // NOTE: Computes the minimal tree containing the leaves of the truncation
     def minimalCompletionNodes() : Stream[(NodeLabel, Option[Int])] = {
-      if(leaves.length == 0)
+      if(leaves.length == 0) {
         Stream((rootLabel, none()))
-      else {
+      } else if(leaves.length == 1 && leaves(0) == rootLabel) {
+        Stream((rootLabel, some(0)))
+      } else {
         // If necessary add a left/right-most leaf
         val firstLeaf = leaves.head
         val lastLeaf = leaves.last
@@ -643,21 +645,24 @@ object ScalaDensity {
 
   // WARNING: Approx. because it does not merge cells where removing one point
   // puts it below the splitting criterion
-  def looL2ErrorApproxFromCells(total : Count, cells : Iterable[(Volume, Count)]) : Double =
+  def looL2ErrorApproxFromCells(totali : Count, cells : Iterable[(Volume, Count)]) : Double = {
+    val total = 1.0 * totali
     cells.map {
-      case (v : Volume, c : Count) =>
+      case (v : Volume, ci : Count) =>
+        val c = 1.0*ci
         // (c/(v*total))^2 * v
       	val dtotsq = (c/total)*(c/total)/v
         // 1/total * (c-1)/(v*(total-1)) * c
         val douts = c*(c-1)/(v*(total - 1)*total)
         dtotsq - 2*douts
     }.sum
+  }
 
   type PriorityFunction[H] = (NodeLabel, Count, Volume) => H
 
   type Probability = Double
 
-  case class TailProbabilities(tree : SpatialTree, tails : LeafMap[Probability]) {
+  case class TailProbabilities(tree : SpatialTree, tails : LeafMap[Probability]) extends Serializable {
     def query(v : MLVector) : Double = {
       tails.query(tree.descendBox(v)) match {
         case (_, None)    => 0

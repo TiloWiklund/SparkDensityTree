@@ -410,7 +410,10 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   }
 
   "backtrack" should "traverses all ancestors in correct order" in {
-    def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    // def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    def prio(lab : NodeLabel, c : Count, v : Volume) : Double =
+      (1 - (1.0*c)/h.totalCount)*v
+
     // def lims(tv : Volume, tc : Count)(d : Int, v : Volume, c : Count) : Boolean =
     //   c > 100 || (1 - c/tc)*v/tv > 0.1
     // val h = histogram(df, lims, noEarlyStop)
@@ -442,7 +445,9 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   }
 
   it should "only traverse ancestors" in {
-    def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    // def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    def prio(lab : NodeLabel, c : Count, v : Volume) : Double =
+      (1 - (1.0*c)/h.totalCount)*v
 
     h.backtrackNodes(prio).foreach {
       case n =>
@@ -454,19 +459,25 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   }
 
   it should "traverse everything once" in {
-    def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    // def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    def prio(lab : NodeLabel, c : Count, v : Volume) : Double =
+      (1 - (1.0*c)/h.totalCount)*v
     val tracked = h.backtrackNodes(prio).toVector.toStream
     assertdistinct(tracked)
   }
 
   it should "end in trivial histogram" in {
-    def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    // def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    def prio(lab : NodeLabel, c : Count, v : Volume) : Double =
+      (1 - (1.0*c)/h.totalCount)*v
 
     assert(h.backtrack(prio).toStream.last.counts.truncation.leaves === Vector(rootLabel))
   }
 
   it should "traverse all ancestors" in {
-    def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    // def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    def prio(lab : NodeLabel, c : Count, v : Volume) : Double =
+      (1 - (1.0*c)/h.totalCount)*v
 
     // h.backtrack(prio).toVector.reverse.take(10).foreach(x=>println(x.counts.truncation.leaves))
 
@@ -484,7 +495,9 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   }
 
   it should "remove the correct leaf node" in {
-    def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    // def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    def prio(lab : NodeLabel, c : Count, v : Volume) : Double =
+      (1 - (1.0*c)/h.totalCount)*v
 
     h.backtrackWithNodes(prio).toStream.sliding(2).toStream.foreach {// .zip(h.backtrackNodes(prio).sliding(2).toStream).foreach {
       case ((_, n1, h1) #:: (_, n2, _) #:: _) =>
@@ -497,7 +510,9 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   }
 
   it should "give histograms of decreasing size" in {
-    def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    // def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    def prio(lab : NodeLabel, c : Count, v : Volume) : Double =
+      (1 - (1.0*c)/h.totalCount)*v
 
     // def go(xs : Stream[(NodeLabel, Count)]) : Boolean = cs match {
     //   case Stream.Empty => true
@@ -622,7 +637,9 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   }
 
   "backtrackTo" should "behave like backtrack when target is root" in {
-    def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    // def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    def prio(lab : NodeLabel, c : Count, v : Volume) : Double =
+      (1 - (1.0*c)/h.totalCount)*v
 
     val bt  = h.backtrackWithNodes(prio).toStream
     val btT = h.backtrackToWithNodes(prio,bt.last._3).toStream
@@ -637,28 +654,95 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     }
   }
 
-  "backtrackTo" should "behave like prefix of backtrack when target is intermediate node" in {
-    def prio(lab : NodeLabel, c : Count, v : Volume) : (Count, BigInt) = (c, lab.lab)
+  it should "be an coarsing sequence of valid histograms" in {
+    def prio(lab : NodeLabel, c : Count, v : Volume) : Double = (1 - (1.0*c)/h.totalCount)*v
+    def prioC(lab : NodeLabel, c : Count, v : Volume) : Count = c
+
+    val bt  = h.backtrackWithNodes(prio).toStream
+    assert(bt.length > 20)
+    val interm = bt.takeRight(15).head._3
+    val btT = h.backtrackToWithNodes(prioC,interm).toStream
+
+    btT.sliding(2).foreach {
+      case Stream((_, _, h1), (_, _, h2)) =>
+        assert(h1.counts.truncation.leaves === h1.counts.truncation.leaves.sorted(leftRightOrd))
+        val diff1 = h1.counts.truncation.leaves.toSet -- h2.counts.truncation.leaves.toSet
+        val diff2 = h2.counts.truncation.leaves.toSet -- h1.counts.truncation.leaves.toSet
+        assert(diff1.size === 1 || diff1.size == 2)
+        assert(diff2.size === 1)
+        diff2.foreach {
+          case p =>
+          diff1.foreach {
+            case c =>
+              assert(p === c.parent)
+          }
+        }
+    }
+  }
+
+  it should "give refinements of the target" in {
+    def prio(lab : NodeLabel, c : Count, v : Volume) : Double = (1 - (1.0*c)/h.totalCount)*v
+    def prioC(lab : NodeLabel, c : Count, v : Volume) : Count = c
+    val bt  = h.backtrackWithNodes(prio).toStream
+    assert(bt.length > 20)
+    val interm = bt.takeRight(15).head._3
+
+    h.backtrackToWithNodes(prioC,interm).zipWithIndex.foreach {
+      case ((_, _, h), i) =>
+        withClue (i.toString) {
+        h.counts.truncation.leaves.foreach {
+          case l1 =>
+            assert(interm.counts.truncation.leaves.exists {
+                     case l2 =>
+                       l2 == l1 || isAncestorOf(l2, l1)
+                   })
+        }
+        interm.counts.truncation.leaves.foreach {
+          case l2 =>
+            assert(h.counts.truncation.leaves.exists {
+                     case l1 =>
+                       l2 == l1 || isAncestorOf(l2, l1)
+                   })
+        }
+        }
+    }
+    assert(h.backtrackToWithNodes(prioC,interm).toStream.last._3 === interm)
+  }
+
+  it should "behave like prefix of backtrack when target is intermediate node" in {
+    // def prio(lab : NodeLabel, c : Count, v : Volume) : (Count, BigInt) = (c, lab.lab)
+    def prio(lab : NodeLabel, c : Count, v : Volume) : (Double, BigInt) =
+      ((1 - (1.0*c)/h.totalCount)*v, lab.lab)
 
     val bt  = h.backtrackWithNodes(prio).toStream
     assert(bt.length > 20)
     val btT = h.backtrackToWithNodes(prio,bt.takeRight(15).head._3).toStream
 
     assert(bt.length === btT.length+15-1)
-    assert(btT.map(_._2) == bt.map(_._2).take(btT.length))
-    assert(btT.map(_._1) == bt.map(_._1).take(btT.length))
     btT.zip(bt).zipWithIndex.foreach {
       case (((_, _, h1), (_, _, h2)), i) =>
         val l1 = h1.counts.truncation.leaves.toSet
         val l2 = h2.counts.truncation.leaves.toSet
-        val v1 = h1.counts.vals.toSet
-        val v2 = h2.counts.vals.toSet
-        assert((i, l1 -- l2) === (i, Set.empty))
-        assert((i, l2 -- l1) === (i, Set.empty))
-        assert((i, v1 -- v2) === (i, Set.empty))
-        assert((i, v2 -- v1) === (i, Set.empty))
+        assert((i, l1 -- l2, l2 -- l1) === (i, Set.empty, Set.empty))
+        assert((i, h1.counts.vals) === (i, h2.counts.vals))
+    }
+    assert(btT.map(_._2) === bt.map(_._2).take(btT.length))
+    assert(btT.map(_._1) === bt.map(_._1).take(btT.length))
+  }
+
+  "size of completion" should "should be decreasing" in {
+    def prio(lab : NodeLabel, c : Count, v : Volume) : (Double, BigInt) =
+      ((1 - (1.0*c)/h.totalCount)*v, lab.lab)
+    h.backtrack(prio).toStream.map(_.counts.truncation.minimalCompletionNodes.size).sliding(2).foreach {
+      case x => assert(x(0) === x(1) + 1)
     }
   }
+
+  // it should "never backtrack beyond goal" in {
+  //   def prio1(lab : NodeLabel, c : Count, v : Volume) : (Count, BigInt) = (c, lab.lab)
+  //   def prio(lab : NodeLabel, c : Count, v : Volume) : Count =
+  //     (1 - c/h.totalCount)*v
+  // }
 
   // "backtrackTo" should "end in the target histogram" in {
   //   def supportCarveLim(totalVolume : Double, totalCount : Count)(depth : Int, volume : Volume, count : Count) =

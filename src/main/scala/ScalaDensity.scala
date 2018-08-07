@@ -25,7 +25,6 @@ import scala.reflect.ClassTag
 
 import org.apache.spark.rdd._
 import org.apache.spark.rdd.PairRDDFunctions._
-import org.apache.spark.mllib.random.RandomRDDs.normalVectorRDD
 
 import org.apache.spark.mllib.linalg
 import org.apache.spark.mllib.linalg.{ Vector => MLVector, _ }
@@ -65,8 +64,9 @@ object ScalaDensity {
     def upper(along : Axis, intercept : Intercept) : Rectangle =
       split(along, intercept)._2
 
-    def volume() : Volume =
-      ((high, low).zipped map (_-_)) reduce (_*_)
+    def widths() : Vector[Double] = (high, low).zipped map (_-_)
+
+    def volume() : Volume = widths() reduce (_*_)
 
     def contains(v : MLVector) =
       v.toArray.toVector.zip(high.zip(low)).forall { case (c, (h, l)) => h >= c && c >= l }
@@ -118,6 +118,9 @@ object ScalaDensity {
       if(toDepth >= fromDepth) this else ancestor(fromDepth - toDepth)
     }
 
+    def lefts() : Stream[Boolean] = ((0 to depth()) map (lab.testBit(_))).toStream
+    def rights() : Stream[Boolean] = ((0 to depth()) map (!lab.testBit(_))).toStream
+
     // Auxiliary stuff
     def invert() : NodeLabel =
       NodeLabel(lab ^ ((1 << (lab.bitLength-1)) - 1))
@@ -126,6 +129,7 @@ object ScalaDensity {
     def initialRights() : Int =
       invert().initialLefts
 
+    // TODO: Rewrite this in terms of lefts()
     def mrsName() : String = (this #:: ancestors).reverse.flatMap {
       case lab =>
         if(lab == NodeLabel(rootLabel)) "X"
@@ -599,27 +603,82 @@ object ScalaDensity {
 
   ////////
 
-  // TODO: Can we figure out some clever way to do memoisation/caching?
-  case class SpatialTree(rootCell : Rectangle) extends Serializable {
-    def dimension() : Int = rootCell.dimension
+  // TODO: (IMPORTANT) axisAt etc should be replaced by an abstract left/right
+  // test function to accomodate non-axis-alinged strategies
+  abstract class SpatialTree extends Serializable {
+    def rootCell : Rectangle
 
-    def volumeTotal() : Double = rootCell.volume
+    def dimension() : Int = this.rootCell.dimension
+    def volumeTotal() : Double = this.rootCell.volume
 
     def volumeAt(at : NodeLabel) : Double =
-      rootCell.volume / pow(2, at.depth)
+      this.cellAt(at).volume
 
-    def axisAt(at : NodeLabel) : Int =
-      at.depth % dimension()
+    def axisAt(at : NodeLabel) : Int
 
-    def cellAt(at : NodeLabel) : Rectangle =
-      unfoldTree(rootCell)((lab, box) => box.lower(axisAt(lab.parent)),
-                           (lab, box) => box.upper(axisAt(lab.parent)))(at)
+    def cellAt(at : NodeLabel) : Rectangle
 
     def cellAtCached() : CachedUnfoldTree[Rectangle] =
       unfoldTreeCached(rootCell)((lab, box) => box.lower(axisAt(lab.parent)),
                                  (lab, box) => box.upper(axisAt(lab.parent)))
 
-    def descendBoxPrime(point : MLVector) : Stream[(NodeLabel, Rectangle)] = {
+    def descendBoxPrime(point : MLVector) : Stream[(NodeLabel, Rectangle)]
+
+    def descendBox(point : MLVector) : Stream[NodeLabel] = descendBoxPrime(point).map(_._1)
+  }
+
+  case class WidestSplitTree(rootCellM : Rectangle) extends SpatialTree {
+    override def rootCell = rootCellM
+
+    override def volumeAt(at : NodeLabel) : Double =
+      rootCellM.volume / pow(2, at.depth)
+
+    // NOTE: Emulates unfold, since unfold apparently only exists in Scalaz...
+    val splits : Stream[Int] = Stream.iterate((0, rootCellM.widths)) {
+      case (_, ws) =>
+        val i = ws.zipWithIndex.maxBy(_._1)._2
+        (i, ws.updated(i, ws(i)/2))
+    }.map(_._1).tail
+
+    //TODO: Optimise
+    override def axisAt(at : NodeLabel) : Int = splits(at.depth)
+
+    override def cellAt(at : NodeLabel) : Rectangle = (at.lefts zip splits).foldLeft(rootCell) {
+      case (cell, (l, i)) =>
+        if(l) cell.lower(i) else cell.upper(i)
+    }
+
+    // TODO: Make a more efficient implementation of this!
+    // override def cellAtCached() : CachedUnfoldTree[Rectangle]
+
+    override def descendBoxPrime(point : MLVector) : Stream[(NodeLabel, Rectangle)] =
+      splits.scanLeft((rootLabel, rootCell)) {
+        case ((lab, box), along) =>
+          if(box.isStrictLeftOfCentre(along, point))
+            (lab.left, box.lower(along))
+          else
+            (lab.right, box.upper(along))
+    }
+  }
+
+  // TODO: Can we figure out some clever way to do memoisation/caching?
+  case class UniformSplitTree(rootCellM : Rectangle) extends SpatialTree {
+    override def rootCell = rootCellM
+
+    // def dimension() : Int = rootCell.dimension
+    // def volumeTotal() : Double = rootCell.volume
+
+    override def volumeAt(at : NodeLabel) : Double =
+      rootCellM.volume / pow(2, at.depth)
+
+    override def axisAt(at : NodeLabel) : Int =
+      at.depth % dimension()
+
+    override def cellAt(at : NodeLabel) : Rectangle =
+      unfoldTree(rootCell)((lab, box) => box.lower(axisAt(lab.parent)),
+                           (lab, box) => box.upper(axisAt(lab.parent)))(at)
+
+    override def descendBoxPrime(point : MLVector) : Stream[(NodeLabel, Rectangle)] = {
       def step(lab : NodeLabel, box : Rectangle) : (NodeLabel, Rectangle) = {
         val along = axisAt(lab)
 
@@ -631,11 +690,16 @@ object ScalaDensity {
 
       Stream.iterate((rootLabel, rootCell))(Function.tupled(step))
     }
-
-    def descendBox(point : MLVector) : Stream[NodeLabel] = descendBoxPrime(point).map(_._1)
   }
 
-  def spatialTreeRootedAt(rootCell : Rectangle) : SpatialTree = SpatialTree(rootCell)
+  // def spatialTreeRootedAt(rootCell : Rectangle) : SpatialTree = SpatialTree(rootCell)
+  def uniformTreeRootedAt(rootCell : Rectangle) : SpatialTree = UniformSplitTree(rootCell)
+  def widestSideTreeRootedAt(rootCell : Rectangle) : SpatialTree = WidestSplitTree(rootCell)
+
+  type PartitioningStrategy = RDD[MLVector] => SpatialTree
+
+  val widestSideTreeBounding : PartitioningStrategy = (points => widestSideTreeRootedAt(boundingBox(points)))
+  val uniformSideTreeBounding : PartitioningStrategy = (points => uniformTreeRootedAt(boundingBox(points)))
 
   // WARNING: Approx. because it does not merge cells where removing one point
   // puts it below the splitting criterion
@@ -895,7 +959,9 @@ object ScalaDensity {
   def histogramStartingWith(h : Histogram, points : RDD[MLVector], limits : SplitLimits, stop : StopRule) : Histogram =
     histogramFrom(h.tree, h.truncation, points, limits, stop)
 
-  def histogram(points : RDD[MLVector], limits : SplitLimits, stop : StopRule) : Histogram =
-    histogramFrom(spatialTreeRootedAt(boundingBox(points)),
-                  rootTruncation, points, limits, stop)
+  def histogram(points : RDD[MLVector],
+                limits : SplitLimits,
+                stop : StopRule = noEarlyStop,
+                partitioningStrategy : PartitioningStrategy = widestSideTreeBounding) : Histogram =
+    histogramFrom(partitioningStrategy(points), rootTruncation, points, limits, stop)
 }

@@ -20,6 +20,7 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   private var df : RDD[MLVector] = null
   private var bb : Rectangle = null
   private var h : Histogram = null
+  private var tree : SpatialTree = null
 
   private val dfnum = 5000
   private val dfdim = 3
@@ -35,6 +36,7 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     sc = new SparkContext(conf)
     df = normalVectorRDD(sc, dfnum, dfdim, 6, 7387389).cache()
     bb = boundingBox(df)
+    tree = uniformTreeRootedAt(bb)
     h = histogram(df, lims, noEarlyStop)
   }
 
@@ -242,8 +244,6 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   }
 
   "cached unfold" should "should agree with uncached" in {
-    val tree = spatialTreeRootedAt(bb)
-
     val l  = rootLabel.left
     val rl = rootLabel.right.left
     val rr = rootLabel.right.right
@@ -282,31 +282,26 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   }
 
   "spatialTree" should "have bounding box at root" in {
-    val tree = spatialTreeRootedAt(bb)
     assert(tree.cellAt(rootLabel) === bb)
   }
 
   it should "first split on first coordinate" in {
-    val tree = spatialTreeRootedAt(bb)
     assert(tree.axisAt(rootLabel) === 0)
   }
 
   it should "actually split along the right axes" in {
-    val tree = spatialTreeRootedAt(bb)
     assert(tree.cellAt(rootLabel.left).centre(0) != tree.cellAt(rootLabel).centre(0))
     assert(tree.cellAt(rootLabel.left.left).centre(1) != tree.cellAt(rootLabel.left).centre(1))
     assert(tree.cellAt(rootLabel.left.left.left).centre(2) != tree.cellAt(rootLabel.left.left).centre(2))
   }
 
   "descendSpatialTree" should "always terminate" in {
-    val tree = spatialTreeRootedAt(bb)
     val trunc = rootTruncation
     val x = df.takeSample(true, 1).head
     assert(rootLabel === trunc.descendUntilLeaf(tree.descendBox(x)))
   }
 
   "descendBox" should "remain in cell containing point" in {
-    val tree = spatialTreeRootedAt(bb)
     val x = df.takeSample(true, 1).head
     val walk = tree.descendBox(x).take(10)
     var i = 0
@@ -318,7 +313,6 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   }
 
   it should "have boxes aggreing with cellAt" in {
-    val tree = spatialTreeRootedAt(bb)
     val x = df.takeSample(true, 1).head
     val walk = tree.descendBoxPrime(x).take(10)
     walk.foreach {
@@ -350,7 +344,6 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   }
 
   "splitAndCountFrom" should "have only non-splittable boxes and splittable parents" in {
-    val tree = spatialTreeRootedAt(bb)
     val counts = splitAndCountFrom(tree, rootTruncation, df, lims, noEarlyStop)
 
     for((l, c) <- counts) {
@@ -367,7 +360,6 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     def lims(tv : Volume, tc : Count)(d : Int, v : Volume, c : Count) : Boolean =
       c > 100 || (1 - c/tc)*v/tv > 0.1
 
-    val tree = spatialTreeRootedAt(bb)
     val counts = splitAndCountFrom(tree, rootTruncation, df, lims, noEarlyStop)
 
     for((l, c) <- counts) {

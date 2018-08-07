@@ -1,3 +1,11 @@
+import org.apache.spark.{ SparkContext, SparkConf }
+import org.apache.spark.sql.SQLContext
+import org.apache.log4j.{ Logger, Level }
+
+import java.io.{File, PrintWriter}
+import org.apache.spark.mllib.random.RandomRDDs.normalVectorRDD
+
+
 object Examples {
   def main(args: Vector[String]) = {
     Logger.getLogger("org").setLevel(Level.ERROR)

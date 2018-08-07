@@ -950,13 +950,19 @@ object ScalaDensity {
     accCounts.toMap
   }
 
-  def histogramFrom(tree : SpatialTree, trunc : Truncation, points : RDD[MLVector], limits : SplitLimits, stop : StopRule) : Histogram = {
+  def histogramFrom(tree : SpatialTree,
+                    trunc : Truncation,
+                    points : RDD[MLVector],
+                    limits : SplitLimits, stop : StopRule) : Histogram = {
     val counts = splitAndCountFrom(tree, trunc, points, limits, stop)
     val totalCount = counts.values.sum
     Histogram(tree, totalCount, fromNodeLabelMap(counts))
   }
 
-  def histogramStartingWith(h : Histogram, points : RDD[MLVector], limits : SplitLimits, stop : StopRule) : Histogram =
+  def histogramStartingWith(h : Histogram,
+                            points : RDD[MLVector],
+                            limits : SplitLimits,
+                            stop : StopRule = noEarlyStop) : Histogram =
     histogramFrom(h.tree, h.truncation, points, limits, stop)
 
   def histogram(points : RDD[MLVector],

@@ -729,6 +729,10 @@ object ScalaDensity {
     }
   }
 
+  // TODO: There must be a build-in version of this!
+  def priorityQueueFrom[A](start : Seq[A])(implicit ord : Ordering[A]) : PriorityQueue[A] =
+    PriorityQueue(start: _*)(ord)
+
   case class Histogram(tree : SpatialTree, totalCount : Count, counts : LeafMap[Count]) extends Serializable {
     def density(v : MLVector) : Double = {
       counts.query(tree.descendBox(v)) match {
@@ -769,15 +773,15 @@ object ScalaDensity {
     def logPenalisedLik(taurec : Double) : Double =
       log(exp(taurec) - 1) - counts.toIterable.size*taurec + logLik()
 
-    def backtrackWithNodes[H](prio : PriorityFunction[H])(implicit ord : Ordering[H]) : Iterator[(H, NodeLabel, Histogram)] = {
+    def backtrackWithNodes[H](prio : PriorityFunction[H])(implicit ord : Ordering[H]) : (Stream[(H, NodeLabel)], Stream[Histogram]) = {
       val start = counts.cherries(_+_).map {
         case (lab, c) => (prio(lab, c, tree.volumeAt(lab)), lab)
       }.toSeq
 
       val thisOuter : Histogram = this
 
-      class HistogramIterator extends Iterator[(H, NodeLabel, Histogram)] {
-        val q = PriorityQueue(start: _*)(ord.reverse.on(_._1))
+      class HistogramBacktrackIterator extends Iterator[(H, NodeLabel, Histogram)] {
+        val q = priorityQueueFrom(start)(ord.reverse.on(_._1)) // PriorityQueue(start: _*)(ord.reverse.on(_._1))
         var h = thisOuter
         override def hasNext : Boolean = !q.isEmpty
         override def next() : (H, NodeLabel, Histogram) = {
@@ -800,77 +804,86 @@ object ScalaDensity {
         }
       }
 
-      new HistogramIterator()
+      val intermediate = new HistogramBacktrackIterator().toStream
+      (intermediate.map { case (prio, lab, _) => (prio, lab) }, this #:: intermediate.map { case (_, _, h) => h })
     }
 
     def backtrackToWithNodes[H](prio : PriorityFunction[H], hparent : Histogram)(implicit ord : Ordering[H])
-        : Iterator[(H, NodeLabel, Histogram)] = {
+        : (Stream[(H, NodeLabel)], Stream[Histogram]) = {
 
       class BacktrackToIterator extends Iterator[(H, NodeLabel, Histogram)] {
         // Split the histogram into one histogram per fringe-tree at a leaf in
         // hparent...
-        var current = fringes(counts, hparent.truncation)
-        val backtracks = current match {
-          //... and for each one perform a backtrack
+        val (initialTMP, splitsTMP, countMapsTMP) = (fringes(counts, hparent.truncation) match {
           case LeafMap(t, f) =>
-            f.zip(t.leaves).map {
+            //... and for each one perform a backtrack
+          f.toStream.zip(t.leaves.toStream).map {
               case (finner, r) =>
-                // Backtrack each "fringe-tree" histogram until we hit the
-                // corresponding leaf in hparent
-
-                // NOTE: This should really be totalCount (for the priorities to
-                // be computed correctly) even though it's not the same as the
-                // sum of the individual cells, make sure this is not a problem
-                Histogram(tree, totalCount, finner).
-                  backtrackWithNodes(prio).
-                  takeWhile(_._2 != r.parent)
+                // Some gymnastics to make all the laziness work correctly
+                val (splits1, hs1) = Histogram(tree, totalCount, finner).backtrackWithNodes(prio)
+                val (splits2, hs2) = (splits1 zip (hs1.tail)).takeWhile(_._1._2 != r.parent).unzip
+                (finner, splits2.toIterator, hs2.map(_.counts).toIterator)
             }
-        }
+        }).unzip3
+        var current = initialTMP.toVector
+        val splits = splitsTMP.toVector
+        val countMaps = countMapsTMP.toVector
 
-        val pqInit = backtracks.zipWithIndex.filter(_._1.hasNext).map {
-          case (x, i) =>
-            val (p1, lab1, h1) = x.next()
-            (p1, i, lab1, h1)
-        }
+        // val pqInit = splitStream.toStream.zipWithIndex.filter(_.hasNext).map {
+        //   case (x, i) =>
+        //     val (p1, lab1) = x.next()
+        //     (i, p1, lab1)
+        // }
 
-        val q : PriorityQueue[(H, Int, NodeLabel, Histogram)] = PriorityQueue(pqInit: _*)(ord.reverse.on(_._1))
+        //PriorityQueue(pqInit: _*)(ord.reverse.on(_._2))
+        val q : PriorityQueue[(Int, H, NodeLabel)] =
+          priorityQueueFrom(splits.toStream.zipWithIndex.filter(_._1.hasNext).map {
+                              case (x, i) =>
+                                val (p1, lab1) = x.next()
+                                (i, p1, lab1)
+                            })(ord.reverse.on(_._2))
 
-        override def hasNext() : Boolean = !q.isEmpty
+        override def hasNext() : Boolean =
+          !q.isEmpty
+        // { if(q.isEmpty) {
+        //     assert(countMaps.forall(!_.hasNext))
+        //     false
+        //   } else true
+        // }
 
         override def next() : (H, NodeLabel, Histogram) = {
-          val (p, i, lab, h) = q.dequeue()
-          if(!backtracks(i).isEmpty) {
-            backtracks(i).next() match {
-              case (pNew, labNew, hNew) =>
-                q += ((pNew, i, labNew, hNew))
+          val (i, p, lab) = q.dequeue()
+
+          if(!splits(i).isEmpty) {
+            splits(i).next() match {
+              case (pNew, labNew) =>
+                q += ((i, pNew, labNew))
             }
           }
 
-          // TODO: Turn this into a pure Vector
-          current = current match {
-            case LeafMap(t, f) => LeafMap(t, f.updated(i, h.counts))
-          }
+          current = current.updated(i, countMaps(i).next)
 
-          (p, lab, Histogram(tree, totalCount, concatLeafMaps(current.vals)))
+          (p, lab, Histogram(tree, totalCount, concatLeafMaps(current)))
         }
       }
 
-      new BacktrackToIterator()
+      val intermediate = (new BacktrackToIterator()).toStream
+      (intermediate.map { case (prio, lab, _) => (prio, lab) }, this #:: intermediate.map { case (_, _, h) => h })
     }
 
     def backtrackNodes[H](prio : PriorityFunction[H])(implicit ord : Ordering[H])
-        : Iterator[NodeLabel] =
-      backtrackWithNodes(prio)(ord).map(_._2)
+        : Stream[NodeLabel] =
+      backtrackWithNodes(prio)(ord)._1.map(_._2)
 
     def backtrack[H](prio : PriorityFunction[H])(implicit ord : Ordering[H])
-        : Iterator[Histogram] =
-      backtrackWithNodes(prio)(ord).map(_._3)
+        : Stream[Histogram] =
+      backtrackWithNodes(prio)(ord)._2
 
-    def backtrackNodes[H](prio : PriorityFunction[H], hparent : Histogram)(implicit ord : Ordering[H]) : Iterator[NodeLabel] =
-      backtrackToWithNodes(prio, hparent)(ord).map(_._2)
+    def backtrackToNodes[H](prio : PriorityFunction[H], hparent : Histogram)(implicit ord : Ordering[H]) : Stream[NodeLabel] =
+      backtrackToWithNodes(prio, hparent)(ord)._1.map(_._2)
 
-    def backtrackTo[H](prio : PriorityFunction[H], hparent : Histogram)(implicit ord : Ordering[H]) : Iterator[Histogram] =
-      backtrackToWithNodes(prio, hparent)(ord).map(_._3)
+    def backtrackTo[H](prio : PriorityFunction[H], hparent : Histogram)(implicit ord : Ordering[H]) : Stream[Histogram] =
+      backtrackToWithNodes(prio, hparent)(ord)._2
   }
 
   // WARNING: Does not check coherent ordering or same bounding box/tree!

@@ -419,7 +419,8 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     //   filter(x => h.counts.truncation.leaves.exists(isAncestorOf(x, _))).
     //   size
 
-    val bt = h.backtrackWithNodes(prio).toVector.toStream
+    val (splits, _ #:: hs) = h.backtrackWithNodes(prio)
+    val bt = (splits zip hs).map { case ((a, b), c) => (a, b, c) }
 
     bt.tails.foreach {
       case Stream.Empty => ()
@@ -458,12 +459,13 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     assertdistinct(tracked)
   }
 
-  it should "end in trivial histogram" in {
+  it should "begin/end in starting/trivial histogram" in {
     // def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
     def prio(lab : NodeLabel, c : Count, v : Volume) : Double =
       (1 - (1.0*c)/h.totalCount)*v
 
-    assert(h.backtrack(prio).toStream.last.counts.truncation.leaves === Vector(rootLabel))
+    assert(h.backtrack(prio).head === h)
+    assert(h.backtrack(prio).last.counts.truncation.leaves === Vector(rootLabel))
   }
 
   it should "traverse all ancestors" in {
@@ -486,18 +488,24 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     // }
   }
 
-  it should "remove the correct leaf node" in {
+  it should "remove the reported leaf node" in {
     // def prio(lab : NodeLabel, c : Count, v : Volume) : Count = c
     def prio(lab : NodeLabel, c : Count, v : Volume) : Double =
       (1 - (1.0*c)/h.totalCount)*v
 
-    h.backtrackWithNodes(prio).toStream.sliding(2).toStream.foreach {// .zip(h.backtrackNodes(prio).sliding(2).toStream).foreach {
-      case ((_, n1, h1) #:: (_, n2, _) #:: _) =>
-        assert(h1.counts.truncation.leaves.contains(n1))
-        assert(!h1.counts.truncation.leaves.contains(n1.left))
-        assert(!h1.counts.truncation.leaves.contains(n1.right))
-        assert(!h1.counts.truncation.leaves.contains(n2))
-        assert(h1.counts.truncation.leaves.contains(n2.left) || h1.counts.truncation.leaves.contains(n2.right))
+    val (splits, hs) = h.backtrackWithNodes(prio)
+
+    (splits zip hs).foreach {
+      case ((_,lab), hprev) =>
+        val leaves = hprev.counts.truncation.leaves
+        assert(!leaves.contains(lab))
+        assert(leaves.contains(lab.left) || leaves.contains(lab.right))
+    }
+
+    (splits zip (hs.tail)).foreach {
+      case ((_,lab), hprev) =>
+        val leaves = hprev.counts.truncation.leaves
+        assert(hprev.counts.truncation.leaves.contains(lab))
     }
   }
 
@@ -633,8 +641,11 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     def prio(lab : NodeLabel, c : Count, v : Volume) : Double =
       (1 - (1.0*c)/h.totalCount)*v
 
-    val bt  = h.backtrackWithNodes(prio).toStream
-    val btT = h.backtrackToWithNodes(prio,bt.last._3).toStream
+    val (splits, _ #:: hs) = h.backtrackWithNodes(prio)
+    val bt = (splits zip hs).map { case ((a, b), c) => (a, b, c) }
+
+    val (splitsT, _ #:: hsT) = h.backtrackToWithNodes(prio,bt.last._3)
+    val btT = (splitsT zip hsT).map { case ((a, b), c) => (a, b, c) }
 
     assert(bt.length === btT.length)
     btT.zip(bt).foreach {
@@ -650,10 +661,14 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     def prio(lab : NodeLabel, c : Count, v : Volume) : Double = (1 - (1.0*c)/h.totalCount)*v
     def prioC(lab : NodeLabel, c : Count, v : Volume) : Count = c
 
-    val bt  = h.backtrackWithNodes(prio).toStream
+    val (splits, _ #:: hs) = h.backtrackWithNodes(prio)
+    val bt = (splits zip hs).map { case ((a, b), c) => (a, b, c) }
+
     assert(bt.length > 20)
     val interm = bt.takeRight(15).head._3
-    val btT = h.backtrackToWithNodes(prioC,interm).toStream
+
+    val (splitsT, _ #:: hsT) = h.backtrackToWithNodes(prioC,interm)
+    val btT = (splitsT zip hsT).map { case ((a, b), c) => (a, b, c) }
 
     btT.sliding(2).foreach {
       case Stream((_, _, h1), (_, _, h2)) =>
@@ -672,43 +687,67 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     }
   }
 
-  it should "give refinements of the target" in {
+  it should "begin/end in starting/target histogram" in {
     def prio(lab : NodeLabel, c : Count, v : Volume) : Double = (1 - (1.0*c)/h.totalCount)*v
     def prioC(lab : NodeLabel, c : Count, v : Volume) : Count = c
-    val bt  = h.backtrackWithNodes(prio).toStream
+
+    val (splits, _ #:: hs) = h.backtrackWithNodes(prio)
+    val bt = (splits zip hs).map { case ((a, b), c) => (a, b, c) }
+
     assert(bt.length > 20)
     val interm = bt.takeRight(15).head._3
 
-    h.backtrackToWithNodes(prioC,interm).zipWithIndex.foreach {
-      case ((_, _, h), i) =>
-        withClue (i.toString) {
-        h.counts.truncation.leaves.foreach {
-          case l1 =>
-            assert(interm.counts.truncation.leaves.exists {
-                     case l2 =>
-                       l2 == l1 || isAncestorOf(l2, l1)
-                   })
-        }
-        interm.counts.truncation.leaves.foreach {
-          case l2 =>
-            assert(h.counts.truncation.leaves.exists {
-                     case l1 =>
-                       l2 == l1 || isAncestorOf(l2, l1)
-                   })
-        }
-        }
-    }
-    assert(h.backtrackToWithNodes(prioC,interm).toStream.last._3 === interm)
+    assert(h.backtrackTo(prioC,interm).head === h)
+    assert(h.backtrackTo(prioC,interm).last === interm)
   }
+
+  // it should "give refinements of the target" in {
+  //   def prio(lab : NodeLabel, c : Count, v : Volume) : Double = (1 - (1.0*c)/h.totalCount)*v
+  //   def prioC(lab : NodeLabel, c : Count, v : Volume) : Count = c
+
+  //   val (splits, _ #:: hs) = h.backtrackWithNodes(prio)
+  //   val bt = (splits zip hs).map { case ((a, b), c) => (a, b, c) }
+
+  //   assert(bt.length > 20)
+  //   val interm = bt.takeRight(15).head._3
+
+  //   val (splitsT, _ #:: hsT) = h.backtrackToWithNodes(prioC,interm)
+  //   val btT = (splitsT zip hsT).map { case ((a, b), c) => (a, b, c) }
+
+  //   btT.zipWithIndex.foreach {
+  //     case ((_, _, h), i) =>
+  //       withClue (i.toString) {
+  //       h.counts.truncation.leaves.foreach {
+  //         case l1 =>
+  //           assert(interm.counts.truncation.leaves.exists {
+  //                    case l2 =>
+  //                      l2 == l1 || isAncestorOf(l2, l1)
+  //                  })
+  //       }
+  //       interm.counts.truncation.leaves.foreach {
+  //         case l2 =>
+  //           assert(h.counts.truncation.leaves.exists {
+  //                    case l1 =>
+  //                      l2 == l1 || isAncestorOf(l2, l1)
+  //                  })
+  //       }
+  //       }
+  //   }
+  //   assert(h.backtrackTo(prioC,interm).last === interm)
+  // }
 
   it should "behave like prefix of backtrack when target is intermediate node" in {
     // def prio(lab : NodeLabel, c : Count, v : Volume) : (Count, BigInt) = (c, lab.lab)
     def prio(lab : NodeLabel, c : Count, v : Volume) : (Double, BigInt) =
       ((1 - (1.0*c)/h.totalCount)*v, lab.lab)
 
-    val bt  = h.backtrackWithNodes(prio).toStream
+    val (splits, _ #:: hs) = h.backtrackWithNodes(prio)
+    val bt = (splits zip hs).map { case ((a, b), c) => (a, b, c) }
+
     assert(bt.length > 20)
-    val btT = h.backtrackToWithNodes(prio,bt.takeRight(15).head._3).toStream
+
+    val (splitsT, _ #:: hsT) = h.backtrackToWithNodes(prio,bt.takeRight(15).head._3)
+    val btT = (splitsT zip hsT).map { case ((a, b), c) => (a, b, c) }
 
     assert(bt.length === btT.length+15-1)
     btT.zip(bt).zipWithIndex.foreach {

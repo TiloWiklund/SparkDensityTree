@@ -427,8 +427,9 @@ object ScalaDensity {
       }.tail
 
     // TODO: Optimise?
+    // TODO: Figure out better error handling in case Walk starts in empty subtree!
     def descendUntilLeafWhere(labs : Walk) : (NodeLabel, Subset) =
-      labs.zip(descend(labs)).dropWhile{case (_, ss) => ss.size > 1}.head
+      labs.zip(descend(labs)).takeWhile{case (_, ss) => ss.size > 0}.last
 
     def descendUntilLeaf(labs : Walk) : NodeLabel =
       descendUntilLeafWhere(labs)._1
@@ -966,7 +967,8 @@ object ScalaDensity {
   def histogramFrom(tree : SpatialTree,
                     trunc : Truncation,
                     points : RDD[MLVector],
-                    limits : SplitLimits, stop : StopRule) : Histogram = {
+                    limits : SplitLimits,
+                    stop : StopRule) : Histogram = {
     val counts = splitAndCountFrom(tree, trunc, points, limits, stop)
     val totalCount = counts.values.sum
     Histogram(tree, totalCount, fromNodeLabelMap(counts))

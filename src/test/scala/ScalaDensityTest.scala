@@ -18,8 +18,10 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   // }
   private var sc : SparkContext = null
   private var df : RDD[MLVector] = null
+  private var dfLocal : Vector[MLVector] = null
   private var bb : Rectangle = null
   private var h : Histogram = null
+  private var h2 : Histogram = null
   private var tree : SpatialTree = null
 
   private val dfnum = 5000
@@ -29,15 +31,21 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   def lims(totalVolume : Double, totalCount : Count)(depth : Int, volume : Volume, count : Count) =
     count > dfnum/2 || (1 - count/totalCount)*volume > 0.001*totalVolume
 
+  def limsC(totalVolume : Double, totalCount : Count)(depth : Int, volume : Volume, count : Count) =
+    count > 10
+
   override protected def beforeAll() : Unit = {
     Logger.getLogger("org").setLevel(Level.ERROR)
     Logger.getLogger("akka").setLevel(Level.ERROR)
     val conf = new SparkConf().setAppName("ScalaDensityTest").setMaster("local")
     sc = new SparkContext(conf)
     df = normalVectorRDD(sc, dfnum, dfdim, 6, 7387389).cache()
+    dfLocal = df.collect().toVector
     bb = boundingBox(df)
     tree = uniformTreeRootedAt(bb)
-    h = histogram(df, lims, noEarlyStop)
+    h = histogram(df, lims)
+    h2 = histogramStartingWith(h, df, limsC)
+    assert(h2.counts.truncation != h.counts.truncation)
   }
 
   override protected def afterAll() : Unit = {
@@ -299,6 +307,12 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
     val trunc = rootTruncation
     val x = df.takeSample(true, 1).head
     assert(rootLabel === trunc.descendUntilLeaf(tree.descendBox(x)))
+  }
+
+  "descendUntilLeaf" should "end in truncation" in {
+    val t = h.counts.truncation
+    val s = h.tree
+    dfLocal.foreach(x => assert(t.leaves.contains(t.descendUntilLeaf(s.descendBox(x)))))
   }
 
   "descendBox" should "remain in cell containing point" in {
@@ -768,6 +782,14 @@ class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
       case x => assert(x(0) === x(1) + 1)
     }
   }
+
+  "histogramStartingWith" should "generate a refinement" in {
+    val leaves1 = h.counts.truncation.leaves
+    val leaves2 = h2.counts.truncation.leaves
+    val bads = leaves2.filter(lab1 => !leaves1.exists(lab2 => lab2 == lab1 || isAncestorOf(lab2, lab1))).toSet
+    assert(bads.isEmpty)
+  }
+
 
   // it should "never backtrack beyond goal" in {
   //   def prio1(lab : NodeLabel, c : Count, v : Volume) : (Count, BigInt) = (c, lab.lab)

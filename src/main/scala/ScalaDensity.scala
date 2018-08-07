@@ -698,8 +698,8 @@ object ScalaDensity {
 
   type PartitioningStrategy = RDD[MLVector] => SpatialTree
 
-  val widestSideTreeBounding : PartitioningStrategy = (points => widestSideTreeRootedAt(boundingBox(points)))
-  val uniformSideTreeBounding : PartitioningStrategy = (points => uniformTreeRootedAt(boundingBox(points)))
+  val splitAlongWidest : PartitioningStrategy = (points => widestSideTreeRootedAt(boundingBox(points)))
+  val splitUniformly : PartitioningStrategy = (points => uniformTreeRootedAt(boundingBox(points)))
 
   // WARNING: Approx. because it does not merge cells where removing one point
   // puts it below the splitting criterion
@@ -962,6 +962,6 @@ object ScalaDensity {
   def histogram(points : RDD[MLVector],
                 limits : SplitLimits,
                 stop : StopRule = noEarlyStop,
-                partitioningStrategy : PartitioningStrategy = widestSideTreeBounding) : Histogram =
+                partitioningStrategy : PartitioningStrategy = splitAlongWidest) : Histogram =
     histogramFrom(partitioningStrategy(points), rootTruncation, points, limits, stop)
 }

@@ -1,6 +1,5 @@
 import scala.language.postfixOps
 
-import ScalaDensity._
 import org.apache.spark.mllib.linalg.{ Vector => MLVector, _ }
 import scala.math.{abs, pow}
 
@@ -11,6 +10,18 @@ import org.apache.spark.mllib.random.RandomRDDs.normalVectorRDD
 
 import org.scalatest.{ path => testPath, _ }
 import org.scalactic.TolerantNumerics
+
+import co.wiklund.disthist._
+import co.wiklund.disthist.Types._
+import co.wiklund.disthist.NodeLabelFunctions._
+import co.wiklund.disthist.TruncationFunctions._
+import co.wiklund.disthist.LeafMapFunctions._
+import co.wiklund.disthist.RectangleFunctions._
+import co.wiklund.disthist.SpatialTreeFunctions._
+import co.wiklund.disthist.SplitEstimatorFunctions._
+import co.wiklund.disthist.BinarySearchFunctions._
+import co.wiklund.disthist.UnfoldTreeFunctions._
+
 
 class DensityTests extends FlatSpec with Matchers with BeforeAndAfterAll {
   // "it" should "compile" in {
